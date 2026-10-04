@@ -30,7 +30,6 @@ class _SendRichMessage(TelegramMethod[Any]):
     rich_message: dict[str, Any]
     disable_notification: bool | None = None
     protect_content: bool | None = None
-    reply_parameters: dict[str, Any] | None = None
     reply_markup: Any | None = None
 
 
@@ -385,6 +384,58 @@ def legacy_caption_html(content: str | None) -> str:
     return "".join(renderer.parts).strip()
 
 
+
+def compose_rich_media_content(
+    content: str,
+    media_items: Iterable[tuple[str, str]],
+    *,
+    has_spoiler: bool = False,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Embed previously uploaded media and formatted text in one Rich Message."""
+    tag_specs = {
+        "photo": ("photo", "photo"),
+        "video": ("video", "video"),
+        "document": ("document", "document"),
+        "audio": ("audio", "audio"),
+        "animation": ("video", "animation"),
+    }
+    media_tags: list[str] = []
+    attachments: list[dict[str, Any]] = []
+    all_collage_media = True
+
+    for index, (media_type, file_id) in enumerate(media_items, start=1):
+        media_type = media_type.lower()
+        if media_type not in tag_specs or not file_id:
+            raise ValueError(f"Unsupported Rich Message media type: {media_type}")
+        uri_type, api_type = tag_specs[media_type]
+        media_id = f"take_media_{index}"
+        reference = f"tg://{uri_type}?id={media_id}"
+        spoiler = has_spoiler and index == 1
+        if media_type == "photo":
+            tag = f'<img src="{reference}"' + (" tg-spoiler" if spoiler else "") + "/>"
+        elif media_type in {"video", "animation"}:
+            tag = f'<video src="{reference}"' + (" tg-spoiler" if spoiler else "") + "></video>"
+        elif media_type == "document":
+            tag = f'<tg-document src="{reference}"></tg-document>'
+            all_collage_media = False
+        else:
+            tag = f'<audio src="{reference}"></audio>'
+            all_collage_media = False
+
+        attachment = {"id": media_id, "media": {"type": api_type, "media": file_id}}
+        if spoiler and media_type in {"photo", "video"}:
+            attachment["media"]["has_spoiler"] = True
+        attachments.append(attachment)
+        media_tags.append(tag)
+
+    if len(media_tags) > 1 and all_collage_media:
+        media_block = "<tg-collage>" + "".join(media_tags) + "</tg-collage>"
+    else:
+        media_block = "\n".join(media_tags)
+    combined = media_block + ("\n\n" + content if content.strip() else "")
+    return combined, attachments
+
+
 def _configured_fragment(fragment: str | None) -> str:
     """Preserve known owner-authored Rich HTML; escape plain text fragments."""
     if not fragment:
@@ -423,12 +474,13 @@ async def send_rich_html(
     content: str,
     disable_notification: bool = False,
     protect_content: bool = False,
-    reply_to_message_id: int | None = None,
+    media: list[dict[str, Any]] | None = None,
     reply_markup: Any | None = None,
 ) -> Any:
     """Send a Telegram Rich Message through Bot API 10.1+ without lossy fallback."""
     rich_message = {"html": content}
-    reply_parameters = {"message_id": reply_to_message_id} if reply_to_message_id is not None else None
+    if media:
+        rich_message["media"] = media
     native_method = getattr(bot, "send_rich_message", None)
     try:
         if native_method:
@@ -437,7 +489,6 @@ async def send_rich_html(
                 rich_message=rich_message,
                 disable_notification=disable_notification,
                 protect_content=protect_content,
-                reply_parameters=reply_parameters,
                 reply_markup=reply_markup,
             )
         raw = await bot.session.make_request(
@@ -447,7 +498,6 @@ async def send_rich_html(
                 rich_message=rich_message,
                 disable_notification=disable_notification,
                 protect_content=protect_content,
-                reply_parameters=reply_parameters,
                 reply_markup=reply_markup,
             ),
         )
@@ -471,7 +521,6 @@ async def send_rich_html(
                 rich_message={"html": fallback_html},
                 disable_notification=disable_notification,
                 protect_content=protect_content,
-                reply_parameters=reply_parameters,
                 reply_markup=reply_markup,
             )
         raw = await bot.session.make_request(
@@ -481,7 +530,6 @@ async def send_rich_html(
                 rich_message={"html": fallback_html},
                 disable_notification=disable_notification,
                 protect_content=protect_content,
-                reply_parameters=reply_parameters,
                 reply_markup=reply_markup,
             ),
         )
