@@ -401,31 +401,19 @@ async def create_bot_start(message: types.Message, state: FSMContext):
                 buttons.append([InlineKeyboardButton(text="✨ Создать нового в Telegram", url=link)])
         except Exception as exc:
             logger.warning("Could not build managed-bot link (%s)", type(exc).__name__)
-    buttons.append([InlineKeyboardButton(text="🔑 Подключить существующего бота", callback_data="connect_existing_bot")])
+
+    buttons.append([InlineKeyboardButton(text="🤖 Открыть @BotFather и создать бота", url="https://t.me/BotFather")])
+    buttons.append([InlineKeyboardButton(text="🔑 Я создал бота — подключить", callback_data="connect_existing_bot")])
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_bot_creation")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    if management_ready:
-        intro = (
-            "<b>Добавление бота · подключение</b>\n\n"
-            "Выберите способ подключения. Через Telegram бот создаётся в вашем аккаунте и "
-            "подключается автоматически; токен копировать не нужно.\n\n"
-            "Если создаёте бота вручную, выберите второй пункт и пришлите токен от @BotFather. "
-            "Сообщение с токеном будет удалено после проверки."
-        )
-    else:
-        intro = (
-            "<b>Добавление бота · подключение</b>\n\n"
-            "Сначала создайте бота через @BotFather, затем подключите его токеном. "
-            "Сообщение с токеном удаляется после проверки.\n\n"
-            + (
-                "Bot Management Mode включён в конфигурации, но Telegram не подтвердил его для основного бота. "
-                "Проверьте этот режим у @BotFather."
-                if BOT_MANAGEMENT_ENABLED
-                else "Чтобы подключать новых ботов без копирования токенов, включите Bot Management Mode "
-                     "для основного бота в @BotFather и задайте <code>BOT_MANAGEMENT_ENABLED=true</code>."
-            )
-        )
+    intro = (
+        "<b>Добавление бота</b>\\n\\n"
+        "Можно создать бота вручную через @BotFather и подключить его токеном. "
+        "Этот способ работает и без Bot Management Mode.\\n\\n"
+        "Если Telegram разрешил основному боту управлять созданием ботов, выше также появится "
+        "вариант автоматического создания без копирования токена."
+    )
     await message.answer(intro, reply_markup=keyboard, parse_mode="HTML")
     await state.set_state(BotRegistration.waiting_for_method)
 
@@ -434,10 +422,14 @@ async def create_bot_start(message: types.Message, state: FSMContext):
 async def connect_existing_bot(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(BotRegistration.waiting_for_token)
     await callback.message.edit_text(
-        "<b>Подключение существующего бота</b>\n\n"
-        "Пришлите токен бота от @BotFather одним сообщением. Я проверю его и удалю сообщение с токеном.\n\n"
-        "Если бота ещё нет, создайте его командой <code>/newbot</code> в @BotFather.",
+        "<b>Создайте своего бота и подключите его</b>\\n\\n"
+        "1. Откройте @BotFather и отправьте <code>/newbot</code>.\\n"
+        "2. Задайте имя и username нового бота.\\n"
+        "3. Скопируйте выданный токен и вернитесь сюда.\\n"
+        "4. Отправьте токен одним сообщением.\\n\\n"
+        "Я проверю токен и удалю сообщение из этого чата. Сам бот будет работать на этом экземпляре конструктора.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🤖 Открыть @BotFather", url="https://t.me/BotFather"),
             InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_bot_creation")
         ]]),
         parse_mode="HTML",
