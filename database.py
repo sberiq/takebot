@@ -47,6 +47,11 @@ class Database:
                 if name not in bot_columns:
                     await db.execute(f"ALTER TABLE sub_bots ADD COLUMN {name} {declaration}")
 
+            async with db.execute("PRAGMA table_info(messages)") as cursor:
+                message_columns = {row[1] for row in await cursor.fetchall()}
+            if "moderation_message_id" not in message_columns:
+                await db.execute("ALTER TABLE messages ADD COLUMN moderation_message_id INTEGER")
+
             async with db.execute(
                 "SELECT id, bot_token, bot_token_hash FROM sub_bots WHERE bot_token_hash IS NULL"
             ) as cursor:
@@ -182,6 +187,7 @@ class Database:
                     is_anonymous INTEGER DEFAULT 0,
                     message_id INTEGER,
                     admin_message_id INTEGER,
+                    moderation_message_id INTEGER,
                     channel_message_id INTEGER,
                     status TEXT DEFAULT 'pending',
                     content_type TEXT,
@@ -432,6 +438,18 @@ class Database:
             cursor = await db.execute(
                 "UPDATE messages SET status = 'publishing' WHERE id = ? AND sub_bot_id = ? AND status = 'pending'",
                 (message_id, sub_bot_id),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def set_moderation_message_id(
+        self, message_id: int, sub_bot_id: int, moderation_message_id: int
+    ) -> bool:
+        """Store the separate action-card message used for album moderation."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE messages SET moderation_message_id = ? WHERE id = ? AND sub_bot_id = ? AND status = 'pending'",
+                (moderation_message_id, message_id, sub_bot_id),
             )
             await db.commit()
             return cursor.rowcount == 1
@@ -770,8 +788,8 @@ class Database:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT * FROM messages WHERE admin_message_id = ? AND sub_bot_id = ? ORDER BY id DESC LIMIT 1",
-                (admin_message_id, sub_bot_id),
+                "SELECT * FROM messages WHERE (admin_message_id = ? OR moderation_message_id = ?) AND sub_bot_id = ? ORDER BY id DESC LIMIT 1",
+                (admin_message_id, admin_message_id, sub_bot_id),
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
