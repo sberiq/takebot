@@ -1604,7 +1604,7 @@ class SubBotManager:
                 await state.clear()
                 return
             
-            if not (message.text or message.caption):
+            if not rich_html_from_message(message).strip():
                 await message.answer("Отправьте текст или подпись с оформлением.")
                 return
             new_footer = rich_html_from_message(message)
@@ -1700,7 +1700,7 @@ class SubBotManager:
                 await state.clear()
                 return
             
-            if not (message.text or message.caption):
+            if not rich_html_from_message(message).strip():
                 await message.answer("Отправьте текст или подпись с оформлением.")
                 return
             new_header = rich_html_from_message(message)
