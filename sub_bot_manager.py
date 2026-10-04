@@ -3361,65 +3361,22 @@ class SubBotManager:
                             cleaned_lines.append(line)
                         user_caption = '\n'.join(cleaned_lines).strip()
                     
-                    # Определяем, поддерживает ли этот тип контента caption
-                    # Стикеры, video_note, dice, poll не поддерживают caption
-                    supports_caption = content_type not in ['sticker', 'video_note', 'dice', 'poll']
-                    
-                    # Инициализируем переменную для отдельного сообщения с футером
-                    footer_message = None
-                    
+                    supports_caption = content_type in {
+                        'photo', 'video', 'document', 'audio', 'voice', 'animation'
+                    }
                     if supports_caption:
-                        # КРИТИЧНО: Удаляем дубликаты header/footer если они уже есть в тексте
                         user_caption = self._remove_duplicate_header_footer(
-                            user_caption, 
-                            header=post_header, 
-                            footer=post_footer, 
+                            user_caption,
+                            header=post_header,
+                            footer=post_footer,
                             header_mode=header_mode
                         )
-                        
-                        # Формируем финальный caption с header и footer
-                        caption_parts = []
-                        
-                        # Header сверху (добавляем только если его еще нет)
-                        if post_header:
-                            if not self._text_contains_at_start(user_caption, post_header, allow_separators=(header_mode == 'newline')):
-                                if header_mode == 'inline' and user_caption:
-                                    caption_parts.append(post_header + " " + user_caption)
-                                else:
-                                    caption_parts.append(post_header)
-                                    if user_caption:
-                                        caption_parts.append(user_caption)
-                            else:
-                                # Header уже есть - добавляем только текст
-                                if user_caption:
-                                    caption_parts.append(user_caption)
-                        elif user_caption:
-                            caption_parts.append(user_caption)
-                        
-                        # Footer снизу (добавляем только если его еще нет)
-                        if post_footer:
-                            current_text = '\n\n'.join(caption_parts) if caption_parts else ""
-                            if not self._text_contains_at_end(current_text, post_footer, allow_separators=True):
-                                caption_parts.append(post_footer)
-                        
-                        if caption_parts:
-                            caption = "\n\n".join(caption_parts)
-                        else:
-                            caption = None
-                    else:
-                        # Для типов без caption (стикеры, video_note, dice, poll)
-                        caption = None
-                        # Если есть footer или header, отправляем отдельным сообщением после медиа
-                        footer_message = None
-                        combined_msg = []
-                        if post_header:
-                            combined_msg.append(post_header)
-                        if post_footer:
-                            combined_msg.append(post_footer)
-                        if combined_msg:
-                            footer_message = "\n\n".join(combined_msg)
-                    
-                    logger.info(f"Публикуем медиа в канал: content_type={content_type}, has_spoiler={has_spoiler}, user_caption={user_caption[:50] if user_caption else 'None'}, footer={post_footer[:30] if post_footer else 'None'}, final_caption={caption[:100] if caption else 'None'}")
+                    logger.info(
+                        "Publishing media submission %s as one message (type=%s, caption_chars=%s)",
+                        message_db_id,
+                        content_type,
+                        len(user_caption),
+                    )
                     
                     rich_caption_html = compose_post_html(
                         user_caption,
