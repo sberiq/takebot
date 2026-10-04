@@ -1093,6 +1093,16 @@ class SubBotManager:
             
             async def __call__(self, handler, event: types.Message, data):
                 """Middleware для блокировки всех сообщений из админ-чата"""
+                # Let the configured owner explicitly bind a moderation group.
+                # This is the recovery path when Telegram's membership update was missed
+                # or the bot was first added as a regular member.
+                if event.chat.type in {"group", "supergroup"} and event.text and event.from_user:
+                    command = event.text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+                    if command == "/setup":
+                        info = await self.db.get_sub_bot_by_token(self.bot_token)
+                        if info and event.from_user.id == info.get("owner_id"):
+                            return await handler(event, data)
+
                 # КРИТИЧНО: Пропускаем ТОЛЬКО прямые ответы админов на сообщения пользователей
                 # Проверяем, что это ответ И это прямой ответ (не ответ на ответ)
                 if event.reply_to_message:
@@ -1283,14 +1293,57 @@ class SubBotManager:
                 await message.answer(welcome_text, reply_markup=keyboard, parse_mode="HTML")
         
         # ========== ПОДТВЕРЖДЕНИЕ ПРИВЯЗКИ ЧАТА ВЛАДЕЛЬЦЕМ ==========
+        @dp.message(Command("setup"))
+        async def setup_moderation_group(message: types.Message):
+            """Bind this group explicitly after the owner promotes the bot."""
+            if message.chat.type not in {"group", "supergroup"} or not message.from_user:
+                await message.answer("Отправьте /setup в группе модерации.")
+                return
+
+            info = await self.db.get_sub_bot_by_id(sub_bot_id)
+            if not info or message.from_user.id != info.get("owner_id"):
+                return
+
+            try:
+                bot_member = await bot.get_chat_member(message.chat.id, bot.id)
+            except Exception:
+                await message.answer("Не удалось проверить мои права в этой группе. Проверьте, что я в ней состою.")
+                return
+
+            if bot_member.status != "administrator":
+                await message.answer(
+                    "Я вижу эту группу, но для работы чата модерации меня нужно назначить администратором "
+                    "без дополнительных прав. После этого отправьте /setup ещё раз."
+                )
+                return
+
+            await self.db.update_sub_bot_chats(sub_bot_id=sub_bot_id, admin_chat_id=message.chat.id)
+            await message.answer(
+                "✅ Группа подключена как чат модерации. Вернитесь в панель конструктора и обновите статус."
+            )
+
         @dp.my_chat_member()
         async def on_chat_member_updated(update: types.ChatMemberUpdated):
             """Never let a group member silently replace the moderation route."""
             chat = update.chat
-            if update.new_chat_member.status != "administrator" or chat.type not in {"group", "supergroup", "channel"}:
+            if chat.type not in {"group", "supergroup", "channel"}:
                 return
             info = await self.db.get_sub_bot_by_id(sub_bot_id)
             if not info:
+                return
+
+            new_status = update.new_chat_member.status
+            if new_status != "administrator":
+                if chat.type in {"group", "supergroup"} and new_status == "member":
+                    try:
+                        await bot.send_message(
+                            chat.id,
+                            "Я вижу эту группу. Чтобы подключить её как чат модерации, назначьте меня "
+                            "администратором без дополнительных прав. Если статус в панели не обновится, "
+                            "отправьте здесь команду /setup."
+                        )
+                    except Exception:
+                        logger.info("Could not send group setup instructions")
                 return
             kind = "admin" if chat.type in {"group", "supergroup"} else "channel"
             link = None
