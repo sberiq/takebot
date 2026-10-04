@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from html.parser import HTMLParser
 from typing import Any, Iterable
 
 from aiogram import types
@@ -29,6 +30,7 @@ class _SendRichMessage(TelegramMethod[Any]):
     rich_message: dict[str, Any]
     disable_notification: bool | None = None
     protect_content: bool | None = None
+    reply_parameters: dict[str, Any] | None = None
     reply_markup: Any | None = None
 
 
@@ -289,6 +291,100 @@ def requires_rich_message(content: str | None) -> bool:
     return False
 
 
+
+class _LegacyCaptionRenderer(HTMLParser):
+    """Downgrade Rich HTML to tags accepted by Telegram media captions."""
+
+    _LEGACY_TAGS = {
+        "a", "b", "blockquote", "code", "del", "em", "i", "ins", "pre",
+        "s", "span", "strike", "strong", "tg-spoiler", "u",
+    }
+    _HEADINGS = {f"h{level}" for level in range(1, 7)}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.parts: list[str] = []
+        self.link_stack: list[bool] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        values = {key.lower(): value for key, value in attrs}
+        if tag in self._LEGACY_TAGS:
+            if tag == "blockquote":
+                self.parts.append("<blockquote>")
+            elif tag == "a":
+                href = values.get("href")
+                self.link_stack.append(bool(href))
+                if href:
+                    self.parts.append(f'<a href="{html.escape(href, quote=True)}">')
+            elif tag == "code":
+                language_class = values.get("class", "")
+                if language_class.startswith("language-") and re.fullmatch(r"language-[a-zA-Z0-9_+-]+", language_class):
+                    self.parts.append(f'<code class="{language_class}">')
+                else:
+                    self.parts.append("<code>")
+            elif tag == "span":
+                self.parts.append('<span class="tg-spoiler">' if values.get("class") == "tg-spoiler" else "<span>")
+            else:
+                self.parts.append(f"<{tag}>")
+        elif tag in self._HEADINGS:
+            # Telegram media captions do not support Rich HTML heading tags.
+            # Keep the heading text, but render it at normal caption size.
+            self.parts.append("<b>")
+        elif tag == "tg-button":
+            href = values.get("url")
+            self.link_stack.append(bool(href))
+            if href:
+                self.parts.append(f'<a href="{html.escape(href, quote=True)}">')
+        elif tag == "tg-emoji":
+            # Custom emoji are not available in legacy captions; their Unicode
+            # alternative text remains readable.
+            pass
+        elif tag == "summary":
+            self.parts.append("<b>")
+        elif tag == "li":
+            self.parts.append("\n• ")
+        elif tag in {"br", "p", "div", "ul", "ol", "details", "table", "tr"}:
+            self.parts.append("\n")
+        elif tag == "hr":
+            self.parts.append("\n──────────\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._LEGACY_TAGS:
+            if tag == "a":
+                if self.link_stack and self.link_stack.pop():
+                    self.parts.append("</a>")
+            else:
+                self.parts.append(f"</{tag}>")
+        elif tag in self._HEADINGS or tag == "summary":
+            self.parts.append("</b>")
+        elif tag == "tg-button":
+            if self.link_stack and self.link_stack.pop():
+                self.parts.append("</a>")
+        elif tag in {"p", "div", "ul", "ol", "details", "table", "tr", "li"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        self.parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self.parts.append(f"&#{name};")
+
+
+def legacy_caption_html(content: str | None) -> str:
+    """Render Rich HTML as readable legacy HTML for photo/video captions."""
+    if not content:
+        return ""
+    renderer = _LegacyCaptionRenderer()
+    renderer.feed(content)
+    renderer.close()
+    return "".join(renderer.parts).strip()
+
+
 def _configured_fragment(fragment: str | None) -> str:
     """Preserve known owner-authored Rich HTML; escape plain text fragments."""
     if not fragment:
@@ -327,10 +423,12 @@ async def send_rich_html(
     content: str,
     disable_notification: bool = False,
     protect_content: bool = False,
+    reply_to_message_id: int | None = None,
     reply_markup: Any | None = None,
 ) -> Any:
     """Send a Telegram Rich Message through Bot API 10.1+ without lossy fallback."""
     rich_message = {"html": content}
+    reply_parameters = {"message_id": reply_to_message_id} if reply_to_message_id is not None else None
     native_method = getattr(bot, "send_rich_message", None)
     try:
         if native_method:
@@ -339,6 +437,7 @@ async def send_rich_html(
                 rich_message=rich_message,
                 disable_notification=disable_notification,
                 protect_content=protect_content,
+                reply_parameters=reply_parameters,
                 reply_markup=reply_markup,
             )
         raw = await bot.session.make_request(
@@ -348,6 +447,7 @@ async def send_rich_html(
                 rich_message=rich_message,
                 disable_notification=disable_notification,
                 protect_content=protect_content,
+                reply_parameters=reply_parameters,
                 reply_markup=reply_markup,
             ),
         )
@@ -371,6 +471,7 @@ async def send_rich_html(
                 rich_message={"html": fallback_html},
                 disable_notification=disable_notification,
                 protect_content=protect_content,
+                reply_parameters=reply_parameters,
                 reply_markup=reply_markup,
             )
         raw = await bot.session.make_request(
@@ -380,6 +481,7 @@ async def send_rich_html(
                 rich_message={"html": fallback_html},
                 disable_notification=disable_notification,
                 protect_content=protect_content,
+                reply_parameters=reply_parameters,
                 reply_markup=reply_markup,
             ),
         )
