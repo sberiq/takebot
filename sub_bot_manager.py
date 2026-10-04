@@ -27,8 +27,9 @@ from services.ai_moderation import AIModerationService, MAX_MEDIA_BYTES
 from services.access_control import GlobalBanMiddleware
 from services.telegram_rich import (
     compose_post_html,
+    compose_rich_media_content,
     entities_to_rich_html,
-    requires_rich_message,
+    legacy_caption_html,
     rich_message_too_long,
     rich_html_from_message,
     send_rich_html,
@@ -329,7 +330,7 @@ class SubBotManager:
         
         # Разделяем абзацами через \n\n, чтобы избежать ошибок parse_mode на <br>
         return "\n\n".join(parts)
-    
+
     async def _send_media_items(self, bot: Bot, chat_id: int, media_items: list) -> list[types.Message]:
         """Send an album, or its single-item fallback when Telegram delivers only one part."""
         if not media_items:
@@ -377,7 +378,7 @@ class SubBotManager:
         else:
             raise ValueError(f"Unsupported media type: {item.type}")
         return [sent]
-
+    
     def _text_contains_at_start(self, text: str, pattern: str, allow_separators: bool = True) -> bool:
         """
         Проверяет, содержит ли текст pattern в начале (БЕЗ нормализации, сохраняет ВСЕ символы включая невидимые)
@@ -726,7 +727,7 @@ class SubBotManager:
             await self._handle_media_group(bot, sub_bot_id, user_id, is_anonymous, admin_chat_id, group_key, state)
         finally:
             self.media_group_last_seen.pop(group_key, None)
-
+    
     async def _handle_media_group(self, bot: Bot, sub_bot_id: int, user_id: int, 
                                   is_anonymous: bool, admin_chat_id: int, 
                                   group_key: str, state: FSMContext):
@@ -738,7 +739,10 @@ class SubBotManager:
             
             if not group_messages:
                 logger.warning(f"Медиа-группа {group_key} пуста")
-                await bot.send_message(chat_id=user_id, text="❌ Не удалось получить фотографии альбома. Отправьте его ещё раз.")
+                await bot.send_message(
+                    chat_id=user_id,
+                    text="❌ Не удалось получить фотографии альбома. Отправьте его ещё раз.",
+                )
                 return
             
             # Сортируем по времени получения (message_id)
@@ -970,7 +974,10 @@ class SubBotManager:
             
             if not media_group:
                 logger.warning(f"Медиа-группа {group_key} не содержит поддерживаемых медиа")
-                await bot.send_message(chat_id=user_id, text="❌ Не получилось обработать альбом. Отправьте фотографии ещё раз одним альбомом.")
+                await bot.send_message(
+                    chat_id=user_id,
+                    text="❌ Не получилось обработать альбом. Отправьте фотографии ещё раз одним альбомом.",
+                )
                 return
             
             # Отправляем медиа-группу в админ-чат
@@ -1021,6 +1028,7 @@ class SubBotManager:
             )
             
             if is_auto_published:
+                # Публикация в канал
                 channel_id = sub_bot_data.get('channel_id') if sub_bot_data else None
                 post_footer = sub_bot_data.get('post_footer')
                 post_header = sub_bot_data.get('post_header')
@@ -1032,87 +1040,54 @@ class SubBotManager:
                     footer=post_footer,
                     header_mode=header_mode,
                 )
-                rich_caption_separate = requires_rich_message(rich_post_html)
-                caption_html = self._build_html_caption(
-                    header=post_header,
-                    header_mode=header_mode,
-                    user_caption=original_text or "",
-                    footer=post_footer,
-                    user_entities=caption_entities or [],
-                )
-
-                channel_media_group = []
-                channel_caption_added = False
-                for file_id_str in media_file_ids:
-                    try:
-                        media_type, file_id = file_id_str.split(':', 1)
-                        final_caption = None if channel_caption_added else ("" if rich_caption_separate else caption_html)
-                        if final_caption is not None:
-                            channel_caption_added = True
-                        has_html_in_caption = bool(final_caption and not rich_caption_separate and self._is_valid_html(final_caption))
-                        if media_type == 'photo':
-                            channel_media_group.append(InputMediaPhoto(media=file_id, caption=final_caption, parse_mode="HTML" if has_html_in_caption else None))
-                        elif media_type == 'video':
-                            channel_media_group.append(InputMediaVideo(media=file_id, caption=final_caption, parse_mode="HTML" if has_html_in_caption else None))
-                        elif media_type == 'document':
-                            channel_media_group.append(InputMediaDocument(media=file_id, caption=final_caption, parse_mode="HTML" if has_html_in_caption else None))
-                        elif media_type == 'audio':
-                            channel_media_group.append(InputMediaAudio(media=file_id, caption=final_caption, parse_mode="HTML" if has_html_in_caption else None))
-                        else:
-                            raise ValueError(f"Unsupported album media type: {media_type}")
-                    except Exception:
-                        logger.exception("Could not prepare one of the album media items")
-                        channel_media_group = []
-                        break
-
+                media_specs = [tuple(item.split(':', 1)) for item in media_file_ids if ':' in item]
                 sent_msgs = None
-                if channel_media_group and len(channel_media_group) == len(media_file_ids):
+                if media_specs and len(media_specs) == len(media_file_ids):
                     try:
-                        sent_msgs = await self._send_media_items(bot, channel_id, channel_media_group)
-                    except Exception:
-                        logger.exception("Automatic album publication failed")
+                        media_content, rich_media = compose_rich_media_content(
+                            rich_post_html,
+                            media_specs,
+                            has_spoiler=bool(getattr(first_message, 'has_media_spoiler', False)),
+                        )
+                        sent_message = await send_rich_html(
+                            bot,
+                            chat_id=channel_id,
+                            content=media_content,
+                            media=rich_media,
+                        )
+                        sent_msgs = [sent_message]
+                    except Exception as e:
+                        logger.exception("One-message Rich album publication failed")
+                        sent_msgs = None
 
-                if sent_msgs:
-                    try:
-                        await self.db.update_message_status(message_db_id, 'published', sent_msgs[0].message_id)
-                    except Exception:
-                        logger.exception("Album was published but its status could not be saved (id=%s)", message_db_id)
-
-                    rich_caption_failed = False
-                    if rich_caption_separate and rich_post_html.strip():
+                    if sent_msgs:
                         try:
-                            await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
+                            await self.db.update_message_status(message_db_id, 'published', sent_msgs[0].message_id)
                         except Exception:
-                            rich_caption_failed = True
-                            logger.exception("Album was published but its rich caption failed")
+                            logger.exception("Album was published but its status could not be saved (id=%s)", message_db_id)
 
-                    try:
-                        status_text = "✅ <b>Одобрено AI и опубликовано</b>"
-                        if rich_caption_failed:
-                            status_text += "\n⚠️ Дополнительное оформление не отправилось"
-                        await bot.send_message(
-                            chat_id=admin_chat_id,
-                            text=status_text,
-                            reply_to_message_id=admin_message.message_id,
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        logger.exception("Could not send the album auto-publication status to moderators")
+                        try:
+                            status_text = "✅ <b>Одобрено AI и опубликовано</b>"
+                            await bot.send_message(
+                                chat_id=admin_chat_id,
+                                text=status_text,
+                                reply_to_message_id=admin_message.message_id,
+                                parse_mode="HTML",
+                            )
+                        except Exception:
+                            logger.exception("Could not send the album auto-publication status to moderators")
 
-                    submission_acknowledged = True
-                    try:
-                        user_text = "✅ Ваш альбом опубликован в канале."
-                        if rich_caption_failed:
-                            user_text += " Дополнительное оформление не отправилось."
-                        await bot.send_message(
-                            chat_id=user_id,
-                            text=user_text,
-                            reply_to_message_id=first_message.message_id,
-                        )
-                    except Exception:
-                        logger.info("Could not notify submitter about the published album")
-                    self.media_groups.pop(group_key, None)
-                    return
+                        submission_acknowledged = True
+                        try:
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text="✅ Ваш альбом опубликован в канале.",
+                                reply_to_message_id=first_message.message_id,
+                            )
+                        except Exception:
+                            logger.info("Could not notify submitter about the published album")
+                        self.media_groups.pop(group_key, None)
+                        return
 
                 publication_error = "AI одобрил альбом, но автоматическая публикация не удалась; требуется ручная проверка."
                 logger.error("%s (submission_id=%s)", publication_error, message_db_id)
@@ -1153,6 +1128,8 @@ class SubBotManager:
                 logger.info(f"Кнопки модерации отправлены для медиа-группы, message_db_id={message_db_id}")
             except Exception as e:
                 logger.error(f"Ошибка отправки кнопок модерации для медиа-группы: {e}")
+                # Fallback to the first album message; authorization accepts
+                # either this ID or the separately stored action-card ID.
                 try:
                     await bot.edit_message_reply_markup(
                         chat_id=admin_chat_id,
@@ -1188,7 +1165,10 @@ class SubBotManager:
             logger.error(f"Ошибка обработки медиа-группы {group_key}: {e}")
             if not submission_acknowledged:
                 try:
-                    await bot.send_message(chat_id=user_id, text="❌ Не получилось передать альбом на модерацию. Попробуйте отправить его ещё раз.")
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text="❌ Не получилось передать альбом на модерацию. Попробуйте отправить его ещё раз.",
+                    )
                 except Exception:
                     logger.info("Could not send album intake failure notice")
             # Удаляем группу из памяти даже при ошибке
@@ -1208,8 +1188,8 @@ class SubBotManager:
             async def __call__(self, handler, event: types.Message, data):
                 """Middleware для блокировки всех сообщений из админ-чата"""
                 # Let the configured owner explicitly bind a moderation group.
-                # This is the recovery path when Telegram's membership update was missed
-                # or the bot was first added as a regular member.
+                # The command is the recovery path when Telegram's membership
+                # update was missed or the bot was first added as a regular member.
                 if event.chat.type in {"group", "supergroup"} and event.text and event.from_user:
                     command = event.text.split(maxsplit=1)[0].split("@", 1)[0].lower()
                     if command == "/setup":
@@ -1406,6 +1386,35 @@ class SubBotManager:
             else:
                 await message.answer(welcome_text, reply_markup=keyboard, parse_mode="HTML")
         
+        @dp.message(Command("setup"))
+        async def setup_moderation_group(message: types.Message):
+            """Bind this group explicitly after the owner promotes the bot."""
+            if message.chat.type not in {"group", "supergroup"} or not message.from_user:
+                await message.answer("Отправьте /setup в группе модерации.")
+                return
+
+            info = await self.db.get_sub_bot_by_token(bot.token)
+            if not info or message.from_user.id != info.get("owner_id"):
+                return
+
+            try:
+                bot_member = await bot.get_chat_member(message.chat.id, bot.id)
+            except Exception:
+                await message.answer("Не удалось проверить мои права в этой группе. Проверьте, что я в ней состою.")
+                return
+
+            if bot_member.status != "administrator":
+                await message.answer(
+                    "Я вижу эту группу, но для работы чата модерации меня нужно назначить администратором "
+                    "без дополнительных прав. После этого отправьте /setup ещё раз."
+                )
+                return
+
+            await self.db.update_sub_bot_chats(sub_bot_id=sub_bot_id, admin_chat_id=message.chat.id)
+            await message.answer(
+                "✅ Группа подключена как чат модерации. Вернитесь в панель конструктора и обновите статус."
+            )
+
         @dp.message(Command("setchannel"))
         async def setup_publication_channel(message: types.Message):
             """Let the owner bind a channel when Telegram's membership update is missed."""
@@ -1476,35 +1485,6 @@ class SubBotManager:
             )
 
         # ========== ПОДТВЕРЖДЕНИЕ ПРИВЯЗКИ ЧАТА ВЛАДЕЛЬЦЕМ ==========
-        @dp.message(Command("setup"))
-        async def setup_moderation_group(message: types.Message):
-            """Bind this group explicitly after the owner promotes the bot."""
-            if message.chat.type not in {"group", "supergroup"} or not message.from_user:
-                await message.answer("Отправьте /setup в группе модерации.")
-                return
-
-            info = await self.db.get_sub_bot_by_id(sub_bot_id)
-            if not info or message.from_user.id != info.get("owner_id"):
-                return
-
-            try:
-                bot_member = await bot.get_chat_member(message.chat.id, bot.id)
-            except Exception:
-                await message.answer("Не удалось проверить мои права в этой группе. Проверьте, что я в ней состою.")
-                return
-
-            if bot_member.status != "administrator":
-                await message.answer(
-                    "Я вижу эту группу, но для работы чата модерации меня нужно назначить администратором "
-                    "без дополнительных прав. После этого отправьте /setup ещё раз."
-                )
-                return
-
-            await self.db.update_sub_bot_chats(sub_bot_id=sub_bot_id, admin_chat_id=message.chat.id)
-            await message.answer(
-                "✅ Группа подключена как чат модерации. Вернитесь в панель конструктора и обновите статус."
-            )
-
         @dp.my_chat_member()
         async def on_chat_member_updated(update: types.ChatMemberUpdated):
             """Never let a group member silently replace the moderation route."""
@@ -1535,6 +1515,7 @@ class SubBotManager:
                     except Exception:
                         logger.info("Could not send group setup instructions")
                 return
+
             kind = "admin" if chat.type in {"group", "supergroup"} else "channel"
             link = None
             if chat.type == "channel":
@@ -2843,6 +2824,7 @@ class SubBotManager:
             # Определяем content_type, original_text и entities ПЕРЕД try блоком
             original_entities = None
             has_spoiler = False
+            media_reference = None
             if message.text:
                 content_type = 'text'
                 original_text = message.text
@@ -2852,19 +2834,23 @@ class SubBotManager:
                 original_text = message.caption or ""
                 original_entities = message.caption_entities
                 has_spoiler = getattr(message, 'has_media_spoiler', False) or False
+                media_reference = f"photo:{message.photo[-1].file_id}"
             elif message.video:
                 content_type = 'video'
                 original_text = message.caption or ""
                 original_entities = message.caption_entities
                 has_spoiler = getattr(message, 'has_media_spoiler', False) or False
+                media_reference = f"video:{message.video.file_id}"
             elif message.document:
                 content_type = 'document'
                 original_text = message.caption or ""
                 original_entities = message.caption_entities
+                media_reference = f"document:{message.document.file_id}"
             elif message.audio:
                 content_type = 'audio'
                 original_text = message.caption or ""
                 original_entities = message.caption_entities
+                media_reference = f"audio:{message.audio.file_id}"
             elif message.voice:
                 content_type = 'voice'
                 original_text = message.caption or ""
@@ -2873,6 +2859,7 @@ class SubBotManager:
                 content_type = 'animation'
                 original_text = message.caption or ""
                 original_entities = message.caption_entities
+                media_reference = f"animation:{message.animation.file_id}"
             elif message.video_note:
                 content_type = 'video_note'
                 original_text = ""
@@ -2905,7 +2892,8 @@ class SubBotManager:
                 # ШАГ 3: Сохраняем в базу ПЕРЕД созданием кнопок
                 logger.info(f"Сохранение сообщения: content_type={content_type}, original_text={original_text[:50] if original_text else 'None'}, user_id={user_id}")
             
-                status = 'published' if is_auto_published else 'pending'
+                # The row stays pending until Telegram confirms the post.
+                status = 'pending'
             
                 message_db_id = await self.db.add_message(
                     sub_bot_id=sub_bot_id,
@@ -2917,7 +2905,8 @@ class SubBotManager:
                     original_text=original_text,
                     original_entities=original_entities_json,
                     status=status,
-                    has_spoiler=has_spoiler
+                    has_spoiler=has_spoiler,
+                    media_group_message_ids=media_reference,
                 )
             
                 # ШАГ 4: Добавляем кнопки модерации или авто-публикация
@@ -2945,32 +2934,39 @@ class SubBotManager:
                             footer=post_footer,
                             header_mode=header_mode,
                         )
-                        has_rich_only_tags = requires_rich_message(rich_post_html)
-                        final_caption_html = self._build_html_caption(
-                            header=post_header,
-                            header_mode=header_mode,
-                            user_caption=user_text,
-                            footer=post_footer,
-                            user_entities=original_entities or [],
-                        )
-
+                        final_caption_html = legacy_caption_html(rich_post_html)
                         if content_type == 'text':
-                            await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
+                            channel_message = await send_rich_html(
+                                bot,
+                                chat_id=channel_id,
+                                content=rich_post_html,
+                            )
                         elif content_type in {'photo', 'video', 'document', 'audio', 'animation'}:
-                            caption = "" if has_rich_only_tags else final_caption_html
-                            copied = await bot.copy_message(
+                            media_content, rich_media = compose_rich_media_content(
+                                rich_post_html,
+                                [tuple(media_reference.split(':', 1))],
+                                has_spoiler=has_spoiler,
+                            )
+                            await send_rich_html(
+                                bot,
+                                chat_id=channel_id,
+                                content=media_content,
+                                media=rich_media,
+                            )
+                        else:
+                            # Telegram has no caption field for polls, stickers, or
+                            # video notes; keep them as one native channel message.
+                            channel_message = await bot.copy_message(
                                 chat_id=channel_id,
                                 from_chat_id=message.chat.id,
                                 message_id=message.message_id,
-                                caption=caption,
-                                parse_mode="HTML" if not has_rich_only_tags and self._is_valid_html(final_caption_html) else None,
                             )
-                            if has_rich_only_tags:
-                                await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
-                        else:
-                            msg = await bot.copy_message(chat_id=channel_id, from_chat_id=message.chat.id, message_id=message.message_id)
-                            if post_header or post_footer or user_text:
-                                await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
+
+                        await self.db.update_message_status(
+                            message_db_id,
+                            'published',
+                            channel_message.message_id,
+                        )
 
                         # Уведомление пользователю
                         await message.answer("✅ Ваше предложение опубликовано в канале!")
@@ -3099,8 +3095,9 @@ class SubBotManager:
                             await release_claim_if_unpublished()
                             return
                         
-                        # Парсим file_id из строки
-                        media_items = []
+                        # The Bot API 10.2 Rich Message media field keeps the
+                        # album and its complete formatting inside one message.
+                        media_specs = []
                         user_caption = original_text_from_db if original_text_from_db else ""
                         
                         rich_post_html = compose_post_html(
@@ -3110,19 +3107,7 @@ class SubBotManager:
                             footer=post_footer,
                             header_mode=header_mode,
                         )
-                        rich_caption_separate = requires_rich_message(rich_post_html)
-                        caption = self._build_html_caption(
-                            header=post_header,
-                            header_mode=header_mode,
-                            user_caption=user_caption,
-                            footer=post_footer,
-                            user_entities=original_entities or [],
-                        ) or None
-                        if caption and self._get_utf16_length(caption) > 1024:
-                            rich_caption_separate = True
-                        has_valid_html = bool(caption and self._is_valid_html(caption))
-
-                        # Парсим file_id из строки формата "type:file_id"
+                        # Parse file_id values stored as "type:file_id".
                         for file_id_str in group_file_ids_str.split(','):
                             file_id_str = file_id_str.strip()
                             if ':' not in file_id_str:
@@ -3130,38 +3115,9 @@ class SubBotManager:
                             media_type, file_id = file_id_str.split(':', 1)
                             if not file_id:
                                 raise ValueError("Пустой file_id в альбоме")
-                            item_caption = ("" if rich_caption_separate else caption) if not media_items else None
-                            item_parse_mode = "HTML" if not media_items and has_valid_html and not rich_caption_separate else None
-                            if media_type == 'photo':
-                                media_items.append(InputMediaPhoto(
-                                    media=file_id,
-                                    caption=item_caption,
-                                    parse_mode=item_parse_mode,
-                                    has_spoiler=has_spoiler if not media_items else False,
-                                ))
-                            elif media_type == 'video':
-                                media_items.append(InputMediaVideo(
-                                    media=file_id,
-                                    caption=item_caption,
-                                    parse_mode=item_parse_mode,
-                                    has_spoiler=has_spoiler if not media_items else False,
-                                ))
-                            elif media_type == 'document':
-                                media_items.append(InputMediaDocument(
-                                    media=file_id,
-                                    caption=item_caption,
-                                    parse_mode=item_parse_mode,
-                                ))
-                            elif media_type == 'audio':
-                                media_items.append(InputMediaAudio(
-                                    media=file_id,
-                                    caption=item_caption,
-                                    parse_mode=item_parse_mode,
-                                ))
-                            else:
-                                raise ValueError(f"Unsupported media type in album: {media_type}")
+                            media_specs.append((media_type, file_id))
 
-                        if not media_items:
+                        if not media_specs:
                             logger.error("Не удалось распарсить file_id из медиа-группы")
                             try:
                                 if original_reply_markup:
@@ -3172,21 +3128,20 @@ class SubBotManager:
                             await release_claim_if_unpublished()
                             return
                         
-                        logger.info(f"Публикация медиа-группы: {len(media_items)} медиа")
-                        
-                        # КРИТИЧНО: Отправляем медиа-группу в канал
-                        # Все медиа будут отправлены как один альбом
-                        sent_messages = await self._send_media_items(bot, channel_id, media_items)
-                        
-                        # Первое сообщение - основное
-                        channel_message = sent_messages[0]
-                        
-                        logger.info(f"✅ Медиа-группа опубликована в канал: {len(sent_messages)} сообщений из {len(media_items)}")
-                        
-                        # КРИТИЧНО: Сразу обновляем статус в БД
+                        logger.info("Публикация одного Rich Message с %s медиа", len(media_specs))
+                        media_content, rich_media = compose_rich_media_content(
+                            rich_post_html,
+                            media_specs,
+                            has_spoiler=has_spoiler,
+                        )
+                        channel_message = await send_rich_html(
+                            bot,
+                            chat_id=channel_id,
+                            content=media_content,
+                            media=rich_media,
+                        )
+
                         await self.db.update_message_status(message_db_id, 'published', channel_message.message_id)
-                        if rich_caption_separate and rich_post_html.strip():
-                            await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
                         
                         # Обновляем сообщение в админ-чате (добавляем статус и информацию о том, кто одобрил)
                         approver = callback.from_user
@@ -3261,12 +3216,6 @@ class SubBotManager:
                                 from_chat_id=user_id,
                                 message_id=user_message_id
                             )
-                            if post_footer:
-                                await bot.send_message(
-                                    chat_id=channel_id,
-                                    text=post_footer,
-                                    reply_to_message_id=channel_message.message_id
-                                )
                         except Exception as e:
                             logger.error(f"Ошибка публикации старого сообщения: {e}")
                             try:
@@ -3387,17 +3336,6 @@ class SubBotManager:
                         await release_claim_if_unpublished()
                         return
                     
-                    # Если есть footer - отправляем отдельным сообщением
-                    if post_footer:
-                        # Проверяем, есть ли валидное HTML форматирование в footer
-                        has_html_formatting = self._is_valid_html(post_footer)
-                        await bot.send_message(
-                            chat_id=channel_id,
-                            text=post_footer,
-                            reply_to_message_id=channel_message.message_id,
-                            parse_mode="HTML" if has_html_formatting else None,
-                            disable_web_page_preview=True if has_html_formatting else None
-                        )
                 else:
                     # КРИТИЧНО: Проверяем, что это НЕ медиа-группа ПЕРЕД обработкой
                     # Если это медиа-группа, мы уже обработали её выше и вышли через return
@@ -3483,14 +3421,6 @@ class SubBotManager:
                     
                     logger.info(f"Публикуем медиа в канал: content_type={content_type}, has_spoiler={has_spoiler}, user_caption={user_caption[:50] if user_caption else 'None'}, footer={post_footer[:30] if post_footer else 'None'}, final_caption={caption[:100] if caption else 'None'}")
                     
-                    # Всегда формируем HTML caption (конвертируем entities), чтобы сохранить форматирование и избежать дублей
-                    final_caption_html = self._build_html_caption(
-                        header=post_header,
-                        header_mode=header_mode,
-                        user_caption=user_caption,
-                        footer=post_footer,
-                        user_entities=original_entities if original_entities else []
-                    )
                     rich_caption_html = compose_post_html(
                         user_caption,
                         original_entities or [],
@@ -3500,108 +3430,53 @@ class SubBotManager:
                     ) if supports_caption else compose_post_html(
                         "", header=post_header, footer=post_footer, header_mode=header_mode
                     )
-                    rich_caption_separate = requires_rich_message(rich_caption_html)
+                    # Rich-only tags cannot be mixed with media through copyMessage.
+                    # Newly queued media includes its file_id so it can be embedded
+                    # in the same Rich Message as the formatted caption.
+                    final_caption_html = legacy_caption_html(rich_caption_html)
                     
                     try:
-                        # КРИТИЧНО: Если есть спойлер, используем send_photo/send_video вместо copy_message
-                        # copy_message не поддерживает has_spoiler
-                        if has_spoiler and (content_type == 'photo' or content_type == 'video'):
-                            # Получаем file_id через временное копирование
-                            temp_copy = await bot.copy_message(
-                                chat_id=channel_id,
-                                from_chat_id=user_id,
-                                message_id=user_message_id
+                        stored_media = msg_data.get('media_group_message_ids') or ''
+                        stored_media_type, separator, stored_file_id = stored_media.partition(':')
+                        rich_media_types = {'photo', 'video', 'document', 'audio', 'animation'}
+                        if supports_caption and separator and stored_file_id and stored_media_type in rich_media_types:
+                            media_content, rich_media = compose_rich_media_content(
+                                rich_caption_html,
+                                [(stored_media_type, stored_file_id)],
+                                has_spoiler=has_spoiler,
                             )
-                            channel_message = temp_copy
-                            
-                            if content_type == 'photo' and temp_copy.photo:
-                                file_id = temp_copy.photo[-1].file_id
-                                try:
-                                    await bot.delete_message(chat_id=channel_id, message_id=temp_copy.message_id)
-                                except:
-                                    pass
-                                
-                                channel_message = await bot.send_photo(
-                                    chat_id=channel_id,
-                                    photo=file_id,
-                                    caption=("" if rich_caption_separate else final_caption_html) if supports_caption else None,
-                                    parse_mode="HTML" if supports_caption and not rich_caption_separate else None,
-                                    has_spoiler=True,
-                                    disable_web_page_preview=True if supports_caption else None
-                                )
-                            elif content_type == 'video' and temp_copy.video:
-                                file_id = temp_copy.video.file_id
-                                try:
-                                    await bot.delete_message(chat_id=channel_id, message_id=temp_copy.message_id)
-                                except:
-                                    pass
-                                
-                                channel_message = await bot.send_video(
-                                    chat_id=channel_id,
-                                    video=file_id,
-                                    caption=("" if rich_caption_separate else final_caption_html) if supports_caption else None,
-                                    parse_mode="HTML" if supports_caption and not rich_caption_separate else None,
-                                    has_spoiler=True,
-                                    disable_web_page_preview=True if supports_caption else None
-                                )
-                            else:
-                                # Fallback на обычное копирование, если не удалось получить file_id
-                                channel_message = temp_copy
-                                logger.warning(f"Не удалось получить file_id для спойлера, используется обычное копирование")
+                            channel_message = await send_rich_html(
+                                bot,
+                                chat_id=channel_id,
+                                content=media_content,
+                                media=rich_media,
+                            )
                         else:
-                            # Обычное копирование без спойлера
+                            # Older queued submissions may not have a saved file_id.
+                            # Legacy captions still publish as one message within
+                            # Telegram's 1024-character media-caption limit.
+                            if supports_caption and self._get_utf16_length(final_caption_html) > 1024:
+                                raise ValueError(
+                                    "Для одной публикации caption слишком длинный. Отправьте это медиа заново после обновления бота."
+                                )
                             channel_message = await bot.copy_message(
                                 chat_id=channel_id,
                                 from_chat_id=user_id,
                                 message_id=user_message_id,
-                                caption=("" if rich_caption_separate else final_caption_html) if supports_caption else None,
-                                parse_mode="HTML" if supports_caption and not rich_caption_separate else None
+                                caption=(final_caption_html or None) if supports_caption else None,
+                                parse_mode="HTML" if supports_caption and final_caption_html else None,
                             )
                         logger.info(f"Медиа опубликовано в канал: message_id={channel_message.message_id}, has_spoiler={has_spoiler}")
                     except Exception as e:
                         logger.error(f"Ошибка публикации медиа: {e}", exc_info=True)
-                        # Fallback: копируем без caption и отправляем header/footer отдельным сообщением
                         try:
-                            channel_message = await bot.copy_message(
-                                chat_id=channel_id,
-                                from_chat_id=user_id,
-                                message_id=user_message_id
-                            )
-                            if supports_caption and final_caption_html and not rich_caption_separate:
-                                await bot.send_message(
-                                    chat_id=channel_id,
-                                    text=final_caption_html,
-                                    reply_to_message_id=channel_message.message_id,
-                                    parse_mode="HTML",
-                                    disable_web_page_preview=True
-                                )
-                        except Exception as e2:
-                            logger.error(f"Ошибка fallback публикации медиа: {e2}")
-                            try:
-                                if original_reply_markup:
-                                    await callback.message.edit_reply_markup(reply_markup=original_reply_markup)
-                            except:
-                                pass
-                            await callback.answer("❌ Ошибка публикации медиа")
-                            await release_claim_if_unpublished()
-                            return
-
-                    if rich_caption_separate and rich_caption_html.strip():
-                        try:
-                            await send_rich_html(bot, chat_id=channel_id, content=rich_caption_html)
-                        except Exception as rich_exc:
-                            logger.error("Rich HTML media caption failed after media publish (%s)", type(rich_exc).__name__)
-                    
-                    # Если есть footer для типов без caption - отправляем отдельным сообщением
-                    if footer_message and not supports_caption and not rich_caption_separate:
-                        has_html_in_footer_msg = self._is_valid_html(footer_message)
-                        await bot.send_message(
-                            chat_id=channel_id,
-                            text=footer_message,
-                            reply_to_message_id=channel_message.message_id,
-                            parse_mode="HTML" if has_html_in_footer_msg else None,
-                            disable_web_page_preview=True if has_html_in_footer_msg else None
-                        )
+                            if original_reply_markup:
+                                await callback.message.edit_reply_markup(reply_markup=original_reply_markup)
+                        except Exception:
+                            pass
+                        await callback.answer("❌ Ошибка: не удалось опубликовать всё одним сообщением", show_alert=True)
+                        await release_claim_if_unpublished()
+                        return
                 
                 # КРИТИЧНО: Проверяем, что это НЕ медиа-группа перед дальнейшей обработкой
                 # Медиа-группы уже обработаны выше и вышли через return
