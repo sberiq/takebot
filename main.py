@@ -2,6 +2,7 @@
 Главный файл запуска конструктора ботов
 """
 import asyncio
+import html
 import logging
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -19,10 +20,15 @@ from config import (
 )
 from database import Database
 from sub_bot_manager import SubBotManager
-from services.bot_links import managed_bot_creation_link
+from services.bot_links import get_managed_bot_token, managed_bot_creation_link
 from services.access_control import GlobalBanMiddleware, InstanceOwnerMiddleware
 from services.log_safety import install_secret_redaction
-from services.telegram_rich import entities_to_rich_html
+from services.telegram_rich import (
+    compose_post_html,
+    rich_html_from_message,
+    rich_message_too_long,
+    send_rich_html,
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -53,10 +59,12 @@ main_dp.callback_query.outer_middleware(GlobalBanMiddleware(db, exempt_user_id=A
 
 # FSM состояния
 class BotRegistration(StatesGroup):
+    waiting_for_method = State()
     waiting_for_token = State()
     waiting_for_notifications = State()
     waiting_for_footer_choice = State()
     waiting_for_footer_text = State()
+    waiting_for_footer_confirm = State()
     waiting_for_moderation_choice = State()
     waiting_for_gemini_key = State()
     waiting_for_gemini_prompt = State()
@@ -84,9 +92,12 @@ class SubBotSettings(StatesGroup):
     waiting_for_bot_selection = State()
     waiting_for_broadcast = State()
     waiting_for_footer = State()
+    waiting_for_footer_confirm = State()
     waiting_for_header = State()
     waiting_for_header_mode = State()
+    waiting_for_header_confirm = State()
     waiting_for_welcome = State()
+    waiting_for_welcome_confirm = State()
     waiting_for_gemini_key = State()
     waiting_for_gemini_prompt = State()
 
@@ -96,7 +107,7 @@ def get_main_menu(is_owner: bool = False, is_admin: bool = False):
     """Главное меню"""
     buttons = []
     
-    buttons.append([KeyboardButton(text="🤖 Создать бот")])
+    buttons.append([KeyboardButton(text="➕ Добавить бота")])
     
     if is_owner:
         buttons.append([KeyboardButton(text="📋 Мои боты")])
@@ -125,6 +136,18 @@ def get_settings_menu():
 async def cmd_start(message: types.Message):
     """Обработка команды /start"""
     user_id = message.from_user.id
+
+    # The child bot's owner shortcut opens the panel for that specific bot.
+    payload = (message.text or "").partition(" ")[2].strip()
+    if payload.startswith("bot_"):
+        try:
+            sub_bot_id = int(payload[4:])
+        except ValueError:
+            sub_bot_id = 0
+        selected_bot = await db.get_sub_bot_by_id(sub_bot_id) if sub_bot_id else None
+        if selected_bot and selected_bot.get("owner_id") == user_id:
+            await send_sub_bot_panel(message.chat.id, sub_bot_id)
+            return
     
     # Проверяем, есть ли у пользователя боты
     bots = await db.get_all_sub_bots_by_owner(user_id)
@@ -151,7 +174,7 @@ async def cmd_start(message: types.Message):
             "• Анонимные посты\n"
             "• Модерация через кнопки\n"
             "• Статистика и рассылки\n\n"
-            "Нажмите <b>🤖 Создать бот</b> для начала!"
+            "Нажмите <b>➕ Добавить бота</b> для начала!"
         )
 
     await message.answer(welcome_text, reply_markup=get_main_menu(is_owner, is_admin), parse_mode="HTML")
@@ -311,39 +334,115 @@ async def admin_back(callback: types.CallbackQuery):
 
 
 # ========== СОЗДАНИЕ БОТА ==========
-@main_dp.message(F.text == "🤖 Создать бот")
+def rich_html_instructions() -> str:
+    return (
+        "Отправьте обычный текст, текст с форматированием из Telegram или Rich HTML.\n\n"
+        "Для Rich HTML вставьте теги прямо в текст. Пример:\n"
+        "<pre>&lt;h2&gt;Заголовок&lt;/h2&gt;\n"
+        "&lt;blockquote expandable&gt;Цитата&lt;/blockquote&gt;\n"
+        "&lt;hr/&gt;\n"
+        "&lt;details&gt;&lt;summary&gt;Подробнее&lt;/summary&gt;Текст&lt;/details&gt;\n"
+        "&lt;tg-button type=\"url\" url=\"https://t.me/example\"&gt;Открыть канал&lt;/tg-button&gt;</pre>\n"
+        "Поддерживаются заголовки, таблицы, списки, раскрывающиеся блоки, цитаты, формулы, "
+        "ссылки, медиа и Premium emoji. Если оформить текст инструментами Telegram, разметка и "
+        "кастомные emoji преобразуются автоматически. Перед сохранением покажу предпросмотр.\n\n"
+        "<a href=\"https://core.telegram.org/bots/api#rich-html-style\">Справочник Telegram Rich HTML</a>"
+    )
+
+
+async def send_rich_format_preview(
+    chat_id: int,
+    *,
+    header: str | None = None,
+    footer: str | None = None,
+    header_mode: str = "newline",
+) -> bool:
+    preview = compose_post_html(
+        "Пример предложения от подписчика",
+        header=header,
+        footer=footer,
+        header_mode=header_mode,
+    )
+    if rich_message_too_long(preview):
+        return False
+    try:
+        await send_rich_html(main_bot, chat_id=chat_id, content=preview)
+        return True
+    except Exception as exc:
+        logger.info("Rich HTML preview rejected (%s)", type(exc).__name__)
+        return False
+
+
+def html_code_preview(value: str | None, limit: int = 1200) -> str:
+    if not value:
+        return "<i>не задано</i>"
+    snippet = value[:limit]
+    if len(value) > limit:
+        snippet += "…"
+    return f"<pre>{html.escape(snippet)}</pre>"
+
+
+@main_dp.message(F.text.in_({"🤖 Создать бот", "➕ Добавить бота"}))
 async def create_bot_start(message: types.Message, state: FSMContext):
     """Начало создания бота"""
     if message.chat.type != "private":
         return
-    user_id = message.from_user.id
-    
-    # КРИТИЧНО: Сохраняем user_id в state для использования при создании
-    await state.update_data(user_id=user_id)
-    
-    buttons = []
+    await state.clear()
+    await state.update_data(user_id=message.from_user.id)
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    management_ready = False
     if BOT_MANAGEMENT_ENABLED:
-        manager_info = await main_bot.get_me()
-        link = managed_bot_creation_link(manager_info.username, name=BOT_MANAGEMENT_DEFAULT_NAME)
-        buttons.append([InlineKeyboardButton(text="✨ Создать бота по ссылке Telegram", url=link)])
-    buttons.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_bot_creation")])
+        try:
+            manager_info = await main_bot.get_me()
+            management_ready = bool(getattr(manager_info, "can_manage_bots", False))
+            if management_ready:
+                link = managed_bot_creation_link(manager_info.username, name=BOT_MANAGEMENT_DEFAULT_NAME)
+                buttons.append([InlineKeyboardButton(text="✨ Создать нового в Telegram", url=link)])
+        except Exception as exc:
+            logger.warning("Could not build managed-bot link (%s)", type(exc).__name__)
+    buttons.append([InlineKeyboardButton(text="🔑 Подключить существующего бота", callback_data="connect_existing_bot")])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_bot_creation")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-    await message.answer(
-        "🤖 <b>Создание бота</b>\n\n"
-        "Отлично! Для создания бота мне понадобится:\n"
-        "1️⃣ Токен вашего бота от @BotFather\n"
-        "2️⃣ ID админ-чата (куда будут приходить предложки)\n"
-        "3️⃣ ID канала (куда будут публиковаться посты)\n\n"
-        "<b>Шаг 1:</b> Отправьте токен бота или создайте его по ссылке выше.\n\n"
-        "💡 Чтобы получить токен:\n"
-        "- Напишите @BotFather\n"
-        "- Отправьте /newbot и создайте бота\n"
-        "- Скопируйте токен и отправьте сюда",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+
+    if management_ready:
+        intro = (
+            "<b>Добавление бота · подключение</b>\n\n"
+            "Выберите способ подключения. Через Telegram бот создаётся в вашем аккаунте и "
+            "подключается автоматически; токен копировать не нужно.\n\n"
+            "Если создаёте бота вручную, выберите второй пункт и пришлите токен от @BotFather. "
+            "Сообщение с токеном будет удалено после проверки."
+        )
+    else:
+        intro = (
+            "<b>Добавление бота · подключение</b>\n\n"
+            "Сначала создайте бота через @BotFather, затем подключите его токеном. "
+            "Сообщение с токеном удаляется после проверки.\n\n"
+            + (
+                "Bot Management Mode включён в конфигурации, но Telegram не подтвердил его для основного бота. "
+                "Проверьте этот режим у @BotFather."
+                if BOT_MANAGEMENT_ENABLED
+                else "Чтобы подключать новых ботов без копирования токенов, включите Bot Management Mode "
+                     "для основного бота в @BotFather и задайте <code>BOT_MANAGEMENT_ENABLED=true</code>."
+            )
+        )
+    await message.answer(intro, reply_markup=keyboard, parse_mode="HTML")
+    await state.set_state(BotRegistration.waiting_for_method)
+
+
+@main_dp.callback_query(BotRegistration.waiting_for_method, F.data == "connect_existing_bot")
+async def connect_existing_bot(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(BotRegistration.waiting_for_token)
+    await callback.message.edit_text(
+        "<b>Подключение существующего бота</b>\n\n"
+        "Пришлите токен бота от @BotFather одним сообщением. Я проверю его и удалю сообщение с токеном.\n\n"
+        "Если бота ещё нет, создайте его командой <code>/newbot</code> в @BotFather.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_bot_creation")
+        ]]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @main_dp.callback_query(F.data == "cancel_bot_creation")
@@ -454,14 +553,9 @@ async def process_ads_consent(callback: types.CallbackQuery, state: FSMContext):
     ])
     
     await callback.message.edit_text(
-        "📝 <b>Оформление постов</b>\n\n"
-        "Хотите добавить оформление к постам в канале?\n\n"
-        "Это текст, который будет добавляться после каждого сообщения пользователя.\n\n"
-        "Например:\n"
-        "━━━━━━━━━━━━━━━\n"
-        "💬 Ваш канал для предложений\n"
-        "🔗 @your_channel\n\n"
-        "Настроить оформление?",
+        "📝 <b>Настройки перед запуском</b>\n\n"
+        "Настроить оформление постов сейчас? Можно задать текст в Rich HTML и посмотреть, "
+        "как он будет выглядеть в Telegram. Этот шаг можно пропустить и вернуться к нему позже.",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
@@ -480,47 +574,73 @@ async def process_footer_choice(callback: types.CallbackQuery, state: FSMContext
     
     if callback.data == "footer_yes":
         await callback.message.edit_text(
-            "📝 <b>Настройка оформления</b>\n\n"
-            "Отправьте текст оформления, который будет добавляться после каждого поста.\n\n"
-            "Можно использовать:\n"
-            "• Несколько строк\n"
-            "• Эмодзи\n"
-            "• <b>Жирный текст</b>\n"
-            "• <i>Курсив</i>\n"
-            "• <code>Моноширинный</code>\n"
-            "• <a href=\"https://example.com\">Ссылки</a> (без предпросмотра)\n\n"
-            "Пример:\n"
-            "━━━━━━━━━━━━━━━\n"
-            "💬 <b>Предложка от подписчика</b>\n"
-            "📢 <a href=\"https://t.me/channel\">@your_channel</a>",
-            parse_mode="HTML"
+            "<b>Rich HTML · оформление снизу</b>\n\n"
+            f"{rich_html_instructions()}\n\n"
+            "Отправьте готовый фрагмент. Он будет добавлен после текста предложения.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⏭ Пропустить оформление", callback_data="footer_create_skip")
+            ], [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_bot_creation")]]),
+            parse_mode="HTML",
         )
         await state.set_state(BotRegistration.waiting_for_footer_text)
     else:
-        # Без оформления - создаём бота
-        await create_bot_final(callback.message, state, post_footer=None, user_id=callback.from_user.id)
-        await state.clear()
+        await state.update_data(post_footer=None)
+        await ask_moderation_mode(callback.message, state)
     
     await callback.answer()
 
 
 @main_dp.message(BotRegistration.waiting_for_footer_text)
 async def process_footer_text(message: types.Message, state: FSMContext):
-    """Обработка текста оформления"""
-    # Используем HTML текст для поддержки форматирования
-    footer_source = message.text or message.caption or ""
-    footer_entities = message.entities or message.caption_entities
-    footer_text = (
-        entities_to_rich_html(footer_source, footer_entities)
-        if footer_entities
-        else footer_source
-    )
-    
-    # Сохраняем footer в state
+    """Preview Rich HTML before keeping it as the post footer."""
+    footer_text = rich_html_from_message(message)
+    if not (message.text or message.caption):
+        await message.answer("Пришлите текст или подпись к сообщению с оформлением.")
+        return
+    if not await send_rich_format_preview(message.chat.id, footer=footer_text):
+        await message.answer(
+            "Telegram не принял эту разметку или она превышает лимит Rich Message. "
+            "Исправьте HTML и отправьте фрагмент ещё раз. Настройки пока не изменены."
+        )
+        return
+
     await state.update_data(post_footer=footer_text)
-    
-    # Переходим к настройке модерации
-    await ask_moderation_mode(message, state)
+    await state.set_state(BotRegistration.waiting_for_footer_confirm)
+    await message.answer(
+        "Предпросмотр выше. Сохранить оформление для нового бота?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сохранить и продолжить", callback_data="footer_create_save")],
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data="footer_create_edit")],
+            [InlineKeyboardButton(text="⏭ Без оформления", callback_data="footer_create_skip")],
+        ]),
+    )
+
+
+@main_dp.callback_query(BotRegistration.waiting_for_footer_confirm, F.data.in_({"footer_create_save", "footer_create_edit", "footer_create_skip"}))
+async def confirm_registration_footer(callback: types.CallbackQuery, state: FSMContext):
+    if callback.data == "footer_create_edit":
+        await state.set_state(BotRegistration.waiting_for_footer_text)
+        await callback.message.edit_text(
+            f"<b>Отправьте обновлённый фрагмент Rich HTML.</b>\n\n{rich_html_instructions()}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⏭ Пропустить оформление", callback_data="footer_create_skip")
+            ], [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_bot_creation")]]),
+        )
+    else:
+        if callback.data == "footer_create_skip":
+            await state.update_data(post_footer=None)
+        await callback.message.edit_text("✅ Оформление сохранено.")
+        await ask_moderation_mode(callback.message, state)
+    await callback.answer()
+
+
+@main_dp.callback_query(BotRegistration.waiting_for_footer_text, F.data == "footer_create_skip")
+async def skip_registration_footer(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(post_footer=None)
+    await callback.message.edit_text("Оформление пропущено.")
+    await ask_moderation_mode(callback.message, state)
+    await callback.answer()
 
 
 async def create_bot_final(message: types.Message, state: FSMContext, post_footer: str = None, user_id: int = None):
@@ -556,7 +676,8 @@ async def create_bot_final(message: types.Message, state: FSMContext, post_foote
             bot_token=data['token'],
             bot_username=data['username'],
             allow_notifications=data.get('allow_notifications', True),
-            allow_ads=data.get('allow_ads', True)
+            allow_ads=data.get('allow_ads', True),
+            managed_bot_id=data.get("managed_bot_id"),
         )
         
         # Если есть оформление - сохраняем его
@@ -572,33 +693,20 @@ async def create_bot_final(message: types.Message, state: FSMContext, post_foote
         # Запускаем под-бот
         await sub_bot_manager.start_sub_bot(sub_bot_id, data['token'])
         
-        footer_status = f"✅ С оформлением" if post_footer else "❌ Без оформления"
-        mod_status = "🤖 AI (Gemini)" if moderation_mode == 'gemini' else "👤 Ручная"
-        
+        mod_status = "🤖 AI (Gemini)" if moderation_mode == 'gemini' else "👤 Ручная проверка"
         await message.answer(
-            "🎉 <b>Бот создан!</b>\n\n"
-            f"🤖 Ваш бот: @{data['username']}\n"
-            f"📝 Оформление: {footer_status}\n"
-            f"🛡 Модерация: {mod_status}\n\n"
-            "📋 <b>Что дальше:</b>\n\n"
-            "1️⃣ Создайте <b>группу</b> в Telegram\n"
-            "2️⃣ Добавьте бота @{} в группу\n"
-            "3️⃣ Сделайте бота <b>администратором</b> группы\n"
-            "   → Бот автоматически определит админ-чат\n\n"
-            "4️⃣ Создайте <b>канал</b> в Telegram\n"
-            "5️⃣ Добавьте бота @{} в канал\n"
-            "6️⃣ Сделайте бота <b>администратором</b> с правом публикации\n"
-            "   → Бот автоматически определит канал\n\n"
-            "✅ После этого бот готов к работе!\n\n"
-            "Пользователи смогут отправлять предложки боту в личку.".format(data['username'], data['username']),
+            f"✅ Бот @{html.escape(data['username'])} подключён.\n"
+            f"Модерация: {mod_status}.\n\n"
+            "Следующий шаг — добавить его в чат модерации и канал. Откройте панель ниже: "
+            "там будут статусы подключения, Rich HTML оформление и остальные настройки.",
             reply_markup=get_main_menu(True),
             parse_mode="HTML"
         )
-        
+        await send_sub_bot_panel(message.chat.id, sub_bot_id)
         logger.info(f"Создан новый под-бот: @{data['username']} (ID: {sub_bot_id})")
         
     except Exception as e:
-        logger.error(f"Ошибка создания бота: {e}")
+        logger.error("Ошибка создания бота (%s)", type(e).__name__)
         await message.answer(
             "❌ Произошла ошибка при создании бота. Попробуйте еще раз.",
             reply_markup=get_main_menu(False)
@@ -1076,7 +1184,7 @@ async def show_my_bots_page(message_or_callback, page: int = 0, is_edit: bool = 
     logger.info(f"show_my_bots_page: user_id={user_id}, total_bots={len(bots)}")
     
     if not bots:
-        text = "У вас пока нет ботов.\n\nНажмите \"🤖 Создать бот\" чтобы создать первого бота!"
+        text = "У вас пока нет ботов.\n\nНажмите «➕ Добавить бота», чтобы подключить первый экземпляр."
         if is_edit:
             await message_or_callback.message.edit_text(text)
         else:
@@ -1155,13 +1263,12 @@ async def show_help(message: types.Message):
     """Показать помощь"""
     help_text = (
         "ℹ️ <b>Помощь</b>\n\n"
-        "Этот конструктор позволяет создать бота для приема предложений от пользователей.\n\n"
-        "<b>Как это работает:</b>\n"
-        "1. Создаете бота через @BotFather\n"
-        "2. Регистрируете его в конструкторе (только токен)\n"
-        "3. Добавляете бота в группу как администратора\n"
-        "4. Добавляете бота в канал как администратора\n"
-        "5. Готово! Бот автоматически настроится\n\n"
+        "Конструктор помогает подключить отдельного бота для предложений, модерации и публикаций.\n\n"
+        "<b>Быстрый старт:</b>\n"
+        "1. Нажмите «➕ Добавить бота» и выберите подключение через Telegram или токен.\n"
+        "2. В панели бота откройте «Подключить группу и канал».\n"
+        "3. Добавьте бота в чат модерации и канал; панель покажет, что уже подключено.\n"
+        "4. В «Оформлении постов» настройте верхний и нижний Rich HTML фрагменты.\n\n"
         "<b>Возможности:</b>\n"
         "- Несколько ботов на одного владельца\n"
         "- Анонимные и неанонимные посты\n"
@@ -1774,28 +1881,125 @@ async def show_sub_bot_settings(callback: types.CallbackQuery, state: FSMContext
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Рассылка пользователям", callback_data=f"subbot_broadcast_{sub_bot_id}")],
-        [InlineKeyboardButton(text="📊 Статистика бота", callback_data=f"subbot_stats_{sub_bot_id}")],
-        [InlineKeyboardButton(text="📝 Оформление сверху", callback_data=f"subbot_header_{sub_bot_id}")],
-        [InlineKeyboardButton(text="📝 Оформление снизу", callback_data=f"subbot_footer_{sub_bot_id}")],
-        [InlineKeyboardButton(text="💬 Изменить приветствие", callback_data=f"subbot_welcome_{sub_bot_id}")],
-        [InlineKeyboardButton(text="🤖 Настройка AI-модерации", callback_data=f"subbot_moderation_{sub_bot_id}")],
+    keyboard = sub_bot_panel_keyboard(sub_bot_data)
+    text = sub_bot_panel_text(sub_bot_data)
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+def sub_bot_panel_keyboard(sub_bot_data: dict) -> InlineKeyboardMarkup:
+    sub_bot_id = sub_bot_data["id"]
+    username = sub_bot_data.get("bot_username")
+    rows = [
+        [InlineKeyboardButton(text="🧭 Подключить группу и канал", callback_data=f"subbot_setup_{sub_bot_id}")],
+        [InlineKeyboardButton(text="🎨 Оформление постов", callback_data=f"subbot_design_{sub_bot_id}")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data=f"subbot_stats_{sub_bot_id}"),
+         InlineKeyboardButton(text="📢 Рассылка", callback_data=f"subbot_broadcast_{sub_bot_id}")],
+        [InlineKeyboardButton(text="💬 Приветствие", callback_data=f"subbot_welcome_{sub_bot_id}"),
+         InlineKeyboardButton(text="🤖 AI-модерация", callback_data=f"subbot_moderation_{sub_bot_id}")],
+    ]
+    if username:
+        rows.append([InlineKeyboardButton(text="↗️ Открыть бота", url=f"https://t.me/{username}")])
+    if username:
+        rows.append([InlineKeyboardButton(
+            text="➕ Добавить в канал",
+            url=f"https://t.me/{username}?startchannel&admin=post_messages",
+        )])
+    rows.extend([
         [InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"subbot_delete_{sub_bot_id}")],
-        [InlineKeyboardButton(text="🔙 Назад к списку", callback_data="subbot_back_list")]
+        [InlineKeyboardButton(text="🔙 К списку ботов", callback_data="subbot_back_list")],
     ])
-    
-    status_admin = "✅" if sub_bot_data['admin_chat_id'] else "❌"
-    status_channel = "✅" if sub_bot_data['channel_id'] else "❌"
-    
-    text = (
-        f"⚙️ <b>Настройки бота @{sub_bot_data['bot_username']}</b>\n\n"
-        f"Статус:\n"
-        f"Админ-чат: {status_admin}\n"
-        f"Канал: {status_channel}\n\n"
-        f"Выберите действие:"
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def sub_bot_panel_text(sub_bot_data: dict) -> str:
+    username = html.escape(sub_bot_data.get("bot_username") or "без имени", quote=False)
+    admin_status = "✅ подключена" if sub_bot_data.get("admin_chat_id") else "⏳ подключите"
+    channel_status = "✅ подключён" if sub_bot_data.get("channel_id") else "⏳ подключите"
+    ready = bool(sub_bot_data.get("admin_chat_id") and sub_bot_data.get("channel_id"))
+    state_text = "🟢 Бот готов принимать предложения" if ready else "🛠 Осталось подключить чаты"
+    footer_status = "включено" if sub_bot_data.get("post_footer") else "не задано"
+    header_status = "включено" if sub_bot_data.get("post_header") else "не задано"
+    return (
+        f"⚙️ <b>Панель @{username}</b>\n\n"
+        f"{state_text}\n"
+        f"Чат модерации: {admin_status}\n"
+        f"Канал публикаций: {channel_status}\n"
+        f"Оформление сверху: {header_status} · снизу: {footer_status}\n\n"
+        "Сначала подключите группу модерации и канал публикаций. В канале боту нужно право "
+        "публиковать сообщения. Затем настройте оформление и приветствие."
     )
-    
+
+
+async def send_sub_bot_panel(chat_id: int, sub_bot_id: int) -> None:
+    sub_bot_data = await db.get_sub_bot_by_id(sub_bot_id)
+    if not sub_bot_data:
+        return
+    await main_bot.send_message(
+        chat_id,
+        sub_bot_panel_text(sub_bot_data),
+        parse_mode="HTML",
+        reply_markup=sub_bot_panel_keyboard(sub_bot_data),
+    )
+
+
+@main_dp.callback_query(F.data.regexp(r"^subbot_setup_\d+$"))
+async def show_sub_bot_setup(callback: types.CallbackQuery):
+    sub_bot_id = int(callback.data.rsplit("_", 1)[1])
+    sub_bot_data = await db.get_sub_bot_by_id(sub_bot_id)
+    if not sub_bot_data or sub_bot_data["owner_id"] != callback.from_user.id:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    username = html.escape(sub_bot_data.get("bot_username") or "bot", quote=False)
+    admin_status = "✅ подключён" if sub_bot_data.get("admin_chat_id") else "⏳ ожидает подключения"
+    channel_status = "✅ подключён" if sub_bot_data.get("channel_id") else "⏳ ожидает подключения"
+    text = (
+        f"🧭 <b>Первичная настройка @{username}</b>\n\n"
+        f"1. <b>Чат модерации:</b> {admin_status}\n"
+        "Создайте группу для предложений, добавьте в неё бота и назначьте администратором. "
+        "Дополнительные права группе не нужны.\n\n"
+        f"2. <b>Канал публикаций:</b> {channel_status}\n"
+        "Добавьте бота в канал администратором с правом <b>публиковать сообщения</b>.\n\n"
+        "Если вы добавляете бота сами, привязка сохранится автоматически. Если добавил другой "
+        "администратор, бот пришлёт вам запрос на подтверждение. После подключения обоих чатов "
+        "пользователи смогут писать боту в личные сообщения."
+    )
+    rows = []
+    bot_username = sub_bot_data.get("bot_username")
+    if bot_username:
+        rows.append([InlineKeyboardButton(
+            text="➕ Добавить в группу",
+            url=f"https://t.me/{bot_username}?startgroup=start",
+        )])
+    rows.extend([
+        [InlineKeyboardButton(text="🔄 Обновить статусы", callback_data=f"subbot_settings_{sub_bot_id}")],
+        [InlineKeyboardButton(text="⚙️ К панели бота", callback_data=f"subbot_settings_{sub_bot_id}")],
+    ])
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@main_dp.callback_query(F.data.regexp(r"^subbot_design_\d+$"))
+async def show_sub_bot_design(callback: types.CallbackQuery):
+    sub_bot_id = int(callback.data.rsplit("_", 1)[1])
+    sub_bot_data = await db.get_sub_bot_by_id(sub_bot_id)
+    if not sub_bot_data or sub_bot_data["owner_id"] != callback.from_user.id:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    text = (
+        f"🎨 <b>Оформление @{html.escape(sub_bot_data.get('bot_username') or 'bot', quote=False)}</b>\n\n"
+        "Настройте верхний и нижний фрагменты отдельно. Можно писать HTML вручную или прислать "
+        "текст, отформатированный средствами Telegram. Перед сохранением конструктор отправит предпросмотр.\n\n"
+        f"Сверху: {'✅ задано' if sub_bot_data.get('post_header') else 'не задано'}\n"
+        f"Снизу: {'✅ задано' if sub_bot_data.get('post_footer') else 'не задано'}"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬆️ Оформление сверху", callback_data=f"subbot_header_{sub_bot_id}")],
+        [InlineKeyboardButton(text="⬇️ Оформление снизу", callback_data=f"subbot_footer_{sub_bot_id}")],
+        [InlineKeyboardButton(text="🔙 К панели бота", callback_data=f"subbot_settings_{sub_bot_id}")],
+    ])
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
     await callback.answer()
 
@@ -1954,7 +2158,7 @@ async def process_sub_bot_broadcast(message: types.Message, state: FSMContext):
     await state.set_state(SubBotBroadcast.waiting_for_confirm)
 
 
-@main_dp.callback_query(F.data.startswith("subbot_footer_"))
+@main_dp.callback_query(F.data.regexp(r"^subbot_footer_\d+$"))
 async def start_sub_bot_footer_change(callback: types.CallbackQuery, state: FSMContext):
     """Начать изменение оформления под-бота"""
     user_id = callback.from_user.id
@@ -1966,7 +2170,7 @@ async def start_sub_bot_footer_change(callback: types.CallbackQuery, state: FSMC
         return
     
     current_footer = sub_bot_data.get('post_footer')
-    footer_preview = f"<code>{current_footer}</code>" if current_footer else "❌ Не установлено"
+    footer_preview = html_code_preview(current_footer)
     
     await state.update_data(sub_bot_id=sub_bot_id)
     await state.set_state(SubBotSettings.waiting_for_footer)
@@ -1974,11 +2178,8 @@ async def start_sub_bot_footer_change(callback: types.CallbackQuery, state: FSMC
     text = (
         f"📝 <b>Изменение оформления для @{sub_bot_data['bot_username']}</b>\n\n"
         f"<b>Текущее оформление:</b>\n{footer_preview}\n\n"
-        f"Отправьте новый текст оформления.\n\n"
-        f"💡 Можно использовать HTML форматирование:\n"
-        f"• <b>Жирный</b>, <i>курсив</i>, <code>моноширинный</code>\n"
-        f"• <a href=\"https://example.com\">Ссылки</a> (без предпросмотра)\n\n"
-        f"Оформление будет добавляться в самом низу каждого одобренного поста в канале."
+        f"Отправьте новый фрагмент Rich HTML. Он будет добавлен внизу одобренного поста.\n\n"
+        f"{rich_html_instructions()}"
     )
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -2006,28 +2207,63 @@ async def process_sub_bot_footer(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    # Используем HTML текст для поддержки форматирования
-    footer_source = message.text or message.caption or ""
-    footer_entities = message.entities or message.caption_entities
-    new_footer = (
-        entities_to_rich_html(footer_source, footer_entities)
-        if footer_entities
-        else footer_source
+    if message.chat.type != "private" or not (message.text or message.caption):
+        await message.answer("Пришлите текст оформления в личном чате с конструктором.")
+        return
+    new_footer = rich_html_from_message(message)
+    if not await send_rich_format_preview(
+        message.chat.id,
+        header=sub_bot_data.get("post_header"),
+        footer=new_footer,
+        header_mode=sub_bot_data.get("header_mode", "newline"),
+    ):
+        await message.answer(
+            "Telegram не принял разметку или превышен лимит Rich Message. "
+            "Исправьте HTML и пришлите его ещё раз; текущая настройка сохранена."
+        )
+        return
+    await state.update_data(pending_footer=new_footer)
+    await state.set_state(SubBotSettings.waiting_for_footer_confirm)
+    await message.answer(
+        "Предпросмотр выше. Сохранить это оформление?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сохранить", callback_data=f"subbot_footer_confirm_save_{sub_bot_id}")],
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"subbot_footer_confirm_edit_{sub_bot_id}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"subbot_footer_confirm_cancel_{sub_bot_id}")],
+        ]),
     )
-    await db.update_post_footer(sub_bot_id, new_footer)
-    
-    text = (
-        f"✅ <b>Оформление обновлено!</b>\n\n"
-        f"<b>Новое оформление:</b>\n<code>{new_footer}</code>\n\n"
-        f"Оно будет добавляться в самом низу каждого одобренного поста в канале."
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"subbot_settings_{sub_bot_id}")]
-    ])
-    
-    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
-    await state.clear()
+
+
+@main_dp.callback_query(F.data.regexp(r"^subbot_footer_confirm_(save|edit|cancel)_\d+$"))
+async def confirm_sub_bot_footer(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    action, sub_bot_id = parts[3], int(parts[4])
+    data = await state.get_data()
+    sub_bot_data = await db.get_sub_bot_by_id(sub_bot_id)
+    if (not sub_bot_data or sub_bot_data["owner_id"] != callback.from_user.id
+            or data.get("sub_bot_id") != sub_bot_id
+            or await state.get_state() != SubBotSettings.waiting_for_footer_confirm.state):
+        await callback.answer("Нет доступа или предпросмотр устарел", show_alert=True)
+        return
+    if action == "save":
+        await db.update_post_footer(sub_bot_id, data.get("pending_footer"))
+        await state.clear()
+        await callback.message.edit_text(
+            "✅ Rich HTML оформление сохранено. Оно будет добавляться после предложения.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎨 К оформлению", callback_data=f"subbot_design_{sub_bot_id}")
+            ]]),
+        )
+    elif action == "edit":
+        await state.set_state(SubBotSettings.waiting_for_footer)
+        await callback.message.edit_text(
+            f"<b>Отправьте обновлённый фрагмент.</b>\n\n{rich_html_instructions()}",
+            parse_mode="HTML",
+        )
+    else:
+        await state.clear()
+        await callback.message.edit_text("Изменение оформления отменено.")
+    await callback.answer()
 
 
 @main_dp.callback_query(F.data.startswith("subbot_header_change_mode_"))
@@ -2068,14 +2304,14 @@ async def change_header_mode(callback: types.CallbackQuery, state: FSMContext):
         
         text = (
             f"✅ <b>Режим изменен!</b>\n\n"
-            f"<b>Оформление:</b>\n<code>{current_header}</code>\n"
+            f"<b>Оформление:</b>\n{html_code_preview(current_header)}\n"
             f"<b>Новый режим:</b> {mode_text}\n\n"
         )
         
         if new_mode == 'inline':
-            text += f"<b>Пример:</b>\n<code>{current_header}</code> <code>Текст поста...</code>"
+            text += f"<b>Пример:</b>\n{html_code_preview(current_header)} <code>Текст поста...</code>"
         else:
-            text += f"<b>Пример:</b>\n<code>{current_header}</code>\n\n<code>Текст поста...</code>"
+            text += f"<b>Пример:</b>\n{html_code_preview(current_header)}\n\n<code>Текст поста...</code>"
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Изменить режим", callback_data=f"subbot_header_change_mode_{sub_bot_id}")],
@@ -2091,7 +2327,7 @@ async def change_header_mode(callback: types.CallbackQuery, state: FSMContext):
             pass
 
 
-@main_dp.callback_query(F.data.startswith("subbot_header_mode_"))
+@main_dp.callback_query(F.data.regexp(r"^subbot_header_mode_(inline|newline)_\d+$"))
 async def process_sub_bot_header_mode(callback: types.CallbackQuery, state: FSMContext):
     """Обработка выбора режима header"""
     # КРИТИЧНО: Отвечаем сразу
@@ -2123,29 +2359,28 @@ async def process_sub_bot_header_mode(callback: types.CallbackQuery, state: FSMC
             await state.clear()
             return
         
-        # Сохраняем header и mode
-        await db.update_post_header(sub_bot_id, new_header, mode)
-        
-        mode_text = "в одну строку с постом" if mode == 'inline' else "на отдельной строке"
-        
-        text = (
-            f"✅ <b>Оформление сверху обновлено!</b>\n\n"
-            f"<b>Оформление:</b>\n<code>{new_header}</code>\n"
-            f"<b>Режим:</b> {mode_text}\n\n"
+        if not await send_rich_format_preview(
+            callback.message.chat.id,
+            header=new_header,
+            footer=sub_bot_data.get("post_footer"),
+            header_mode=mode,
+        ):
+            await state.set_state(SubBotSettings.waiting_for_header)
+            await callback.message.edit_text(
+                "Telegram не принял разметку предпросмотра. Отправьте исправленный Rich HTML фрагмент."
+            )
+            return
+        await state.update_data(pending_header=new_header, pending_header_mode=mode)
+        await state.set_state(SubBotSettings.waiting_for_header_confirm)
+        mode_text = "в одной строке с предложением" if mode == "inline" else "отдельным блоком сверху"
+        await callback.message.edit_text(
+            f"Предпросмотр выше. Сохранить оформление {mode_text}?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Сохранить", callback_data=f"subbot_header_confirm_save_{sub_bot_id}")],
+                [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"subbot_header_confirm_edit_{sub_bot_id}")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"subbot_header_confirm_cancel_{sub_bot_id}")],
+            ]),
         )
-        
-        if mode == 'inline':
-            text += f"<b>Пример:</b>\n<code>{new_header}</code> <code>Текст поста...</code>"
-        else:
-            text += f"<b>Пример:</b>\n<code>{new_header}</code>\n\n<code>Текст поста...</code>"
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Изменить режим", callback_data=f"subbot_header_change_mode_{sub_bot_id}")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data=f"subbot_settings_{sub_bot_id}")]
-        ])
-        
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
-        await state.clear()
     except Exception as e:
         logger.error(f"Ошибка при сохранении режима header: {e}", exc_info=True)
         try:
@@ -2177,7 +2412,7 @@ async def remove_sub_bot_header(callback: types.CallbackQuery, state: FSMContext
     await callback.answer("✅ Удалено")
 
 
-@main_dp.callback_query(F.data.startswith("subbot_header_"))
+@main_dp.callback_query(F.data.regexp(r"^subbot_header_\d+$"))
 async def start_sub_bot_header_change(callback: types.CallbackQuery, state: FSMContext):
     """Начать изменение оформления сверху под-бота"""
     # КРИТИЧНО: Пропускаем если это уже обработано другими обработчиками
@@ -2197,7 +2432,7 @@ async def start_sub_bot_header_change(callback: types.CallbackQuery, state: FSMC
     
     current_header = sub_bot_data.get('post_header')
     header_mode = sub_bot_data.get('header_mode', 'newline')
-    header_preview = f"<code>{current_header}</code>" if current_header else "❌ Не установлено"
+    header_preview = html_code_preview(current_header)
     mode_text = "в одну строку с постом" if header_mode == 'inline' else "на отдельной строке"
     
     await state.update_data(sub_bot_id=sub_bot_id)
@@ -2207,10 +2442,8 @@ async def start_sub_bot_header_change(callback: types.CallbackQuery, state: FSMC
         f"📝 <b>Оформление сверху для @{sub_bot_data['bot_username']}</b>\n\n"
         f"<b>Текущее оформление:</b>\n{header_preview}\n"
         f"<b>Режим:</b> {mode_text}\n\n"
-        f"Отправьте новый текст оформления.\n\n"
-        f"💡 Можно использовать HTML форматирование:\n"
-        f"• <b>Жирный</b>, <i>курсив</i>, <code>моноширинный</code>\n"
-        f"• <a href=\"https://example.com\">Ссылки</a> (без предпросмотра)\n\n"
+        f"Отправьте новый фрагмент Rich HTML.\n\n"
+        f"{rich_html_instructions()}\n\n"
         f"Оформление будет добавляться В НАЧАЛЕ каждого одобренного поста.\n"
         f"Можно использовать одновременно с оформлением снизу."
     )
@@ -2222,6 +2455,42 @@ async def start_sub_bot_header_change(callback: types.CallbackQuery, state: FSMC
     ])
     
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await callback.answer()
+
+
+@main_dp.callback_query(F.data.regexp(r"^subbot_header_confirm_(save|edit|cancel)_\d+$"))
+async def confirm_sub_bot_header(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    action, sub_bot_id = parts[3], int(parts[4])
+    data = await state.get_data()
+    sub_bot_data = await db.get_sub_bot_by_id(sub_bot_id)
+    if (not sub_bot_data or sub_bot_data["owner_id"] != callback.from_user.id
+            or data.get("sub_bot_id") != sub_bot_id
+            or await state.get_state() != SubBotSettings.waiting_for_header_confirm.state):
+        await callback.answer("Нет доступа или предпросмотр устарел", show_alert=True)
+        return
+    if action == "save":
+        await db.update_post_header(
+            sub_bot_id,
+            data.get("pending_header"),
+            data.get("pending_header_mode", "newline"),
+        )
+        await state.clear()
+        await callback.message.edit_text(
+            "✅ Rich HTML оформление сверху сохранено.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎨 К оформлению", callback_data=f"subbot_design_{sub_bot_id}")
+            ]]),
+        )
+    elif action == "edit":
+        await state.set_state(SubBotSettings.waiting_for_header)
+        await callback.message.edit_text(
+            f"<b>Отправьте обновлённый фрагмент.</b>\n\n{rich_html_instructions()}",
+            parse_mode="HTML",
+        )
+    else:
+        await state.clear()
+        await callback.message.edit_text("Изменение оформления сверху отменено.")
     await callback.answer()
 
 
@@ -2242,13 +2511,10 @@ async def process_sub_bot_header(message: types.Message, state: FSMContext):
         return
     
     # Используем HTML текст для поддержки форматирования
-    header_source = message.text or message.caption or ""
-    header_entities = message.entities or message.caption_entities
-    new_header = (
-        entities_to_rich_html(header_source, header_entities)
-        if header_entities
-        else header_source
-    )
+    if not (message.text or message.caption):
+        await message.answer("Пришлите текст оформления.")
+        return
+    new_header = rich_html_from_message(message)
     await state.update_data(new_header=new_header)
     await state.set_state(SubBotSettings.waiting_for_header_mode)
     
@@ -2259,41 +2525,16 @@ async def process_sub_bot_header(message: types.Message, state: FSMContext):
     ])
     
     await message.answer(
-        f"<b>Выберите режим:</b>\n\n"
-        f"📄 <b>На отдельной строке:</b>\n"
-        f"<code>{new_header}</code>\n\n"
-        f"<code>Текст поста...</code>\n\n"
-        f"📝 <b>В одну строку:</b>\n"
-        f"<code>{new_header}</code> <code>Текст поста...</code>",
+        f"<b>Где показать оформление?</b>\n\n"
+        f"📄 Отдельным блоком перед предложением\n"
+        f"📝 В той же строке перед текстом\n\n"
+        f"После выбора отправлю полный предпросмотр поста.",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
 
 
-@main_dp.callback_query(F.data.startswith("subbot_header_remove_"))
-async def remove_sub_bot_header(callback: types.CallbackQuery, state: FSMContext):
-    """Удалить оформление сверху под-бота"""
-    user_id = callback.from_user.id
-    sub_bot_id = int(callback.data.split("_")[3])
-    
-    sub_bot_data = await db.get_sub_bot_by_id(sub_bot_id)
-    if not sub_bot_data or sub_bot_data['owner_id'] != user_id:
-        await callback.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    await db.update_post_header(sub_bot_id, None, 'newline')
-    
-    text = "✅ <b>Оформление сверху удалено!</b>"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"subbot_settings_{sub_bot_id}")]
-    ])
-    
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
-    await callback.answer("✅ Удалено")
-
-
-@main_dp.callback_query(F.data.startswith("subbot_welcome_"))
+@main_dp.callback_query(F.data.regexp(r"^subbot_welcome_\d+$"))
 async def start_sub_bot_welcome_change(callback: types.CallbackQuery, state: FSMContext):
     """Начать изменение приветствия под-бота"""
     user_id = callback.from_user.id
@@ -2305,7 +2546,7 @@ async def start_sub_bot_welcome_change(callback: types.CallbackQuery, state: FSM
         return
     
     current_welcome = sub_bot_data.get('welcome_message')
-    welcome_preview = f"<code>{current_welcome}</code>" if current_welcome else "❌ Не установлено (используется стандартное)"
+    welcome_preview = html_code_preview(current_welcome) if current_welcome else "❌ Не установлено (используется стандартное)"
     
     await state.update_data(sub_bot_id=sub_bot_id)
     await state.set_state(SubBotSettings.waiting_for_welcome)
@@ -2313,11 +2554,10 @@ async def start_sub_bot_welcome_change(callback: types.CallbackQuery, state: FSM
     text = (
         f"💬 <b>Изменение приветствия для @{sub_bot_data['bot_username']}</b>\n\n"
         f"<b>Текущее приветствие:</b>\n{welcome_preview}\n\n"
-        f"Отправьте новый текст приветствия.\n\n"
+        f"Отправьте текст или Rich HTML. Сначала покажу предпросмотр, и только потом сохраню.\n\n"
         f"💡 Приветствие будет показываться при команде /start.\n"
-        f"💡 Можно использовать HTML-разметку: <b>жирный</b>, <i>курсив</i>, <a href=\"url\">ссылка</a>\n"
         f"💡 Используйте {{mode}} для автоматической вставки текущего режима анонимности\n"
-        f"💡 Внизу автоматически будет добавлена информация о конструкторе"
+        f"💡 Информация о конструкторе не добавляется автоматически."
     )
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -2345,21 +2585,61 @@ async def process_sub_bot_welcome(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    new_welcome = message.text
-    await db.update_welcome_message(sub_bot_id, new_welcome)
-    
-    text = (
-        f"✅ <b>Приветствие обновлено!</b>\n\n"
-        f"<b>Новое приветствие:</b>\n<code>{new_welcome}</code>\n\n"
-        f"Оно будет показываться при команде /start."
+    if not (message.text or message.caption):
+        await message.answer("Пришлите текст приветствия.")
+        return
+    pending_welcome = rich_html_from_message(message)
+    new_welcome = pending_welcome.replace("{mode}", "Не анонимно")
+    if "{mode}" not in pending_welcome:
+        new_welcome += "\n\nТекущий режим: <b>Не анонимно</b>"
+    if rich_message_too_long(new_welcome):
+        await message.answer("Текст длиннее лимита Telegram Rich Message (32 768 знаков). Укоротите и отправьте снова.")
+        return
+    try:
+        await send_rich_html(main_bot, chat_id=message.chat.id, content=new_welcome)
+    except Exception as exc:
+        logger.info("Rich welcome preview rejected (%s)", type(exc).__name__)
+        await message.answer("Telegram не принял разметку. Исправьте HTML и отправьте ещё раз; настройка пока не изменена.")
+        return
+    await state.update_data(pending_welcome=pending_welcome)
+    await state.set_state(SubBotSettings.waiting_for_welcome_confirm)
+    await message.answer(
+        "Предпросмотр выше. Сохранить приветствие?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сохранить", callback_data=f"subbot_welcome_confirm_save_{sub_bot_id}")],
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"subbot_welcome_confirm_edit_{sub_bot_id}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"subbot_welcome_confirm_cancel_{sub_bot_id}")],
+        ]),
     )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"subbot_settings_{sub_bot_id}")]
-    ])
-    
-    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
-    await state.clear()
+
+
+@main_dp.callback_query(F.data.regexp(r"^subbot_welcome_confirm_(save|edit|cancel)_\d+$"))
+async def confirm_sub_bot_welcome(callback: types.CallbackQuery, state: FSMContext):
+    _, _, _, action, sub_bot_id_text = callback.data.split("_")
+    sub_bot_id = int(sub_bot_id_text)
+    data = await state.get_data()
+    sub_bot_data = await db.get_sub_bot_by_id(sub_bot_id)
+    if (not sub_bot_data or sub_bot_data.get("owner_id") != callback.from_user.id
+            or data.get("sub_bot_id") != sub_bot_id
+            or await state.get_state() != SubBotSettings.waiting_for_welcome_confirm.state):
+        await callback.answer("Нет доступа или предпросмотр устарел", show_alert=True)
+        return
+    if action == "save":
+        await db.update_welcome_message(sub_bot_id, data.get("pending_welcome"))
+        await state.clear()
+        await callback.message.edit_text(
+            "✅ Rich HTML приветствие сохранено.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 К панели бота", callback_data=f"subbot_settings_{sub_bot_id}")
+            ]]),
+        )
+    elif action == "edit":
+        await state.set_state(SubBotSettings.waiting_for_welcome)
+        await callback.message.edit_text(f"Отправьте изменённый текст.\n\n{rich_html_instructions()}", parse_mode="HTML")
+    else:
+        await state.clear()
+        await callback.message.edit_text("Изменение приветствия отменено.")
+    await callback.answer()
 
 
 @main_dp.callback_query(F.data.startswith("subbot_welcome_remove_"))
@@ -2592,6 +2872,11 @@ async def main():
     # Инициализация базы данных
     await db.init_db()
     logger.info("База данных инициализирована")
+    try:
+        manager_info = await main_bot.get_me()
+        sub_bot_manager.manager_username = manager_info.username
+    except Exception as exc:
+        logger.warning("Could not resolve manager username (%s)", type(exc).__name__)
 
     @main_dp.managed_bot()
     async def on_managed_bot(update):
@@ -2604,7 +2889,7 @@ async def main():
             return
         managed_bot_id = update.bot.id
         try:
-            token = await main_bot.get_managed_bot_token(user_id=managed_bot_id)
+            token = await get_managed_bot_token(main_bot, user_id=managed_bot_id)
         except Exception as exc:
             logger.warning("Could not retrieve managed bot token (%s)", type(exc).__name__)
             await main_bot.send_message(creator_id, "Не удалось получить созданного бота. Обратитесь к владельцу конструктора.")
@@ -2655,12 +2940,14 @@ async def main():
         await context.clear()
         await main_bot.send_message(
             creator_id,
-            f"✅ Бот @{update.bot.username} подключён. Теперь добавьте его администратором в чат модерации и канал. "
-            "Каждую новую привязку нужно подтвердить кнопкой, которую пришлёт сам бот.",
+            f"✅ @{html.escape(update.bot.username or 'новый бот')} добавлен. Откройте панель для подключения чатов, "
+            "Rich HTML оформления, приветствия и остальных настроек.",
+            parse_mode="HTML",
         )
+        await send_sub_bot_panel(creator_id, sub_bot_id)
     
     # ========== УДАЛЕНИЕ ПОД-БОТОВ ==========
-    @main_dp.callback_query(F.data.startswith("subbot_delete_"))
+    @main_dp.callback_query(F.data.regexp(r"^subbot_delete_\d+$"))
     async def confirm_sub_bot_delete(callback: types.CallbackQuery, state: FSMContext):
         """Подтверждение удаления под-бота"""
         user_id = callback.from_user.id

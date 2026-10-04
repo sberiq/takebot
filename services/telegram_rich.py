@@ -11,6 +11,14 @@ from aiogram.methods import TelegramMethod
 from aiogram.exceptions import TelegramBadRequest
 
 
+MAX_RICH_MESSAGE_CHARS = 32768
+_HTML_TAG_RE = re.compile(r"<\s*(/?)\s*([a-z][a-z0-9-]*)\b([^>]*)>", re.IGNORECASE)
+_LEGACY_HTML_TAGS = {
+    "a", "b", "blockquote", "code", "del", "em", "i", "ins", "pre",
+    "s", "span", "strike", "strong", "tg-spoiler", "u",
+}
+
+
 class _SendRichMessage(TelegramMethod[Any]):
     """Raw API method fallback for aiogram versions predating Bot API 10.1."""
 
@@ -21,7 +29,7 @@ class _SendRichMessage(TelegramMethod[Any]):
     rich_message: dict[str, Any]
     disable_notification: bool | None = None
     protect_content: bool | None = None
-    reply_markup: dict[str, Any] | None = None
+    reply_markup: Any | None = None
 
 
 def _offset_index(text: str, offset: int) -> int | None:
@@ -102,6 +110,38 @@ def entities_to_rich_html(text: str, entities: Iterable[types.MessageEntity] | N
     return "".join(output)
 
 
+def rich_html_from_message(message: types.Message) -> str:
+    """Convert Telegram text formatting to Rich HTML, or accept explicitly typed HTML."""
+    source = message.text or message.caption or ""
+    entities = message.entities or message.caption_entities
+    if entities:
+        return entities_to_rich_html(source, entities)
+    if re.search(r"</?[A-Za-z][^>]*>", source):
+        return source
+    return html.escape(source, quote=False)
+
+
+def rich_message_too_long(content: str) -> bool:
+    """Telegram Rich Messages are limited to 32,768 UTF-8 characters."""
+    return len(content) > MAX_RICH_MESSAGE_CHARS
+
+
+def requires_rich_message(content: str | None) -> bool:
+    """Whether the content uses tags unsupported by Telegram's legacy HTML parse mode."""
+    if not content:
+        return False
+    for match in _HTML_TAG_RE.finditer(content):
+        tag_name = match.group(2).lower()
+        attributes = match.group(3).lower()
+        if tag_name not in _LEGACY_HTML_TAGS:
+            return True
+        if tag_name == "blockquote" and "expandable" in attributes:
+            return True
+        if tag_name == "a" and "name=" in attributes and "href=" not in attributes:
+            return True
+    return False
+
+
 def _configured_fragment(fragment: str | None) -> str:
     """Preserve known owner-authored Rich HTML; escape plain text fragments."""
     if not fragment:
@@ -140,6 +180,7 @@ async def send_rich_html(
     content: str,
     disable_notification: bool = False,
     protect_content: bool = False,
+    reply_markup: Any | None = None,
 ) -> Any:
     """Send a Telegram Rich Message through Bot API 10.1+ without lossy fallback."""
     rich_message = {"html": content}
@@ -151,6 +192,7 @@ async def send_rich_html(
                 rich_message=rich_message,
                 disable_notification=disable_notification,
                 protect_content=protect_content,
+                reply_markup=reply_markup,
             )
         raw = await bot.session.make_request(
             bot,
@@ -159,6 +201,7 @@ async def send_rich_html(
                 rich_message=rich_message,
                 disable_notification=disable_notification,
                 protect_content=protect_content,
+                reply_markup=reply_markup,
             ),
         )
     except TelegramBadRequest as exc:
@@ -181,6 +224,7 @@ async def send_rich_html(
                 rich_message={"html": fallback_html},
                 disable_notification=disable_notification,
                 protect_content=protect_content,
+                reply_markup=reply_markup,
             )
         raw = await bot.session.make_request(
             bot,
@@ -189,6 +233,7 @@ async def send_rich_html(
                 rich_message={"html": fallback_html},
                 disable_notification=disable_notification,
                 protect_content=protect_content,
+                reply_markup=reply_markup,
             ),
         )
     if isinstance(raw, dict) and "message_id" in raw:

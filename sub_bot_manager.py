@@ -25,7 +25,14 @@ from database import Database
 from config import GEMINI_MODEL
 from services.ai_moderation import AIModerationService, MAX_MEDIA_BYTES
 from services.access_control import GlobalBanMiddleware
-from services.telegram_rich import compose_post_html, entities_to_rich_html, send_rich_html
+from services.telegram_rich import (
+    compose_post_html,
+    entities_to_rich_html,
+    requires_rich_message,
+    rich_message_too_long,
+    rich_html_from_message,
+    send_rich_html,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +50,14 @@ class BlockUser(StatesGroup):
 class ChangeFooter(StatesGroup):
     """Состояния для изменения оформления поста"""
     waiting_for_footer = State()
+    waiting_for_confirmation = State()
 
 
 class ChangeHeader(StatesGroup):
     """Состояния для изменения оформления сверху"""
     waiting_for_header = State()
     waiting_for_mode = State()
+    waiting_for_confirmation = State()
 
 
 def entities_to_json(entities: List[types.MessageEntity]) -> str:
@@ -100,6 +109,7 @@ class SubBotManager:
         self.media_groups: Dict[str, list] = {}  # media_group_id: [messages]
         self.user_message_windows: Dict[tuple[int, int], deque] = {}
         self.media_group_rate_keys: Dict[tuple[int, int, str], float] = {}
+        self.manager_username: str | None = None
     
     async def start_sub_bot(self, sub_bot_id: int, bot_token: str):
         """Запустить под-бот"""
@@ -973,6 +983,23 @@ class SubBotManager:
                 # Публикация в канал
                 channel_id = sub_bot_data['channel_id']
                 post_footer = sub_bot_data.get('post_footer')
+                post_header = sub_bot_data.get('post_header')
+                header_mode = sub_bot_data.get('header_mode', 'newline')
+                rich_post_html = compose_post_html(
+                    original_text or "",
+                    caption_entities or [],
+                    header=post_header,
+                    footer=post_footer,
+                    header_mode=header_mode,
+                )
+                rich_caption_separate = requires_rich_message(rich_post_html)
+                caption_html = self._build_html_caption(
+                    header=post_header,
+                    header_mode=header_mode,
+                    user_caption=original_text or "",
+                    footer=post_footer,
+                    user_entities=caption_entities or [],
+                )
                 
                 # Подготовка медиа для канала
                 channel_media_group = []
@@ -982,21 +1009,10 @@ class SubBotManager:
                     try:
                         media_type, file_id = file_id_str.split(':', 1)
                         
-                        # Caption
-                        final_caption = None
-                        if not channel_caption_added:
-                            if original_text and post_footer:
-                                final_caption = original_text + "\n\n" + post_footer
-                            elif original_text:
-                                final_caption = original_text
-                            elif post_footer:
-                                final_caption = post_footer
-                            
-                            if final_caption:
-                                channel_caption_added = True
-                        
-                        # Определяем, есть ли валидное HTML форматирование в caption
-                        has_html_in_caption = final_caption and self._is_valid_html(final_caption)
+                        final_caption = None if channel_caption_added else ("" if rich_caption_separate else caption_html)
+                        if final_caption is not None:
+                            channel_caption_added = True
+                        has_html_in_caption = bool(final_caption and not rich_caption_separate and self._is_valid_html(final_caption))
                             
                         if media_type == 'photo':
                             channel_media_group.append(InputMediaPhoto(media=file_id, caption=final_caption, parse_mode="HTML" if has_html_in_caption else None))
@@ -1014,6 +1030,8 @@ class SubBotManager:
                         sent_msgs = await bot.send_media_group(chat_id=channel_id, media=channel_media_group)
                         # Обновляем статус с ID сообщения в канале (первого)
                         await self.db.update_message_status(message_db_id, 'published', sent_msgs[0].message_id)
+                        if rich_caption_separate and rich_post_html.strip():
+                            await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
                         # Уведомление пользователю
                         await bot.send_message(chat_id=user_id, text="✅ Ваше предложение опубликовано в канале!", reply_to_message_id=first_message.message_id)
                     except Exception as e:
@@ -1180,7 +1198,6 @@ class SubBotManager:
             is_owner = user_id == sub_bot_info['owner_id']
             
             if is_owner:
-                # Для владельца показываем статус без кнопок
                 status_text = "👋 <b>Добро пожаловать, владелец!</b>\n\n"
                 
                 if not sub_bot_info['admin_chat_id']:
@@ -1198,22 +1215,15 @@ class SubBotManager:
                 if sub_bot_info['admin_chat_id'] and sub_bot_info['channel_id']:
                     status_text += "🎉 Бот готов к работе!\n\n"
                 
-                status_text += "<b>Команды в админ-чате:</b>\n"
-                status_text += "/stats - статистика\n"
-                status_text += "/block USER_ID - заблокировать\n"
-                status_text += "/unblock USER_ID - разблокировать\n\n"
-                status_text += "<b>Для управления ботом используйте главного бота-конструктора</b>"
-                
-                # Кнопки управления для владельца
-                keyboard = ReplyKeyboardMarkup(
-                    keyboard=[
-                        [KeyboardButton(text="📢 Рассылка пользователям")],
-                        [KeyboardButton(text="📊 Статистика бота")],
-                        [KeyboardButton(text="📝 Оформление снизу"), KeyboardButton(text="📝 Оформление сверху")]
-                    ],
-                    resize_keyboard=True
-                )
-                
+                status_text += "Все настройки, Rich HTML оформление, статистика и рассылки находятся в панели конструктора."
+                keyboard = None
+                if self.manager_username:
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="⚙️ Открыть панель управления",
+                            url=f"https://t.me/{self.manager_username}?start=bot_{sub_bot_id}",
+                        )
+                    ]])
                 await message.answer(status_text, parse_mode="HTML", reply_markup=keyboard)
                 return
             
@@ -1262,7 +1272,15 @@ class SubBotManager:
                     f"Текущий режим: <b>{mode_text}</b>"
                 )
             
-            await message.answer(welcome_text, reply_markup=keyboard, parse_mode="HTML")
+            if custom_welcome:
+                await send_rich_html(
+                    bot,
+                    chat_id=message.chat.id,
+                    content=welcome_text,
+                    reply_markup=keyboard,
+                )
+            else:
+                await message.answer(welcome_text, reply_markup=keyboard, parse_mode="HTML")
         
         # ========== ПОДТВЕРЖДЕНИЕ ПРИВЯЗКИ ЧАТА ВЛАДЕЛЬЦЕМ ==========
         @dp.my_chat_member()
@@ -1586,26 +1604,50 @@ class SubBotManager:
                 await state.clear()
                 return
             
-            new_footer = (
-                entities_to_rich_html(message.text or "", message.entities)
-                if message.entities
-                else message.text
-            )
-            
-            # Сохраняем новое оформление
-            await self.db.update_post_footer(sub_bot_id, new_footer)
-            logger.info(f"Оформление обновлено для бота {sub_bot_id} владельцем {user_id}: {new_footer[:50]}")
-            
+            if not (message.text or message.caption):
+                await message.answer("Отправьте текст или подпись с оформлением.")
+                return
+            new_footer = rich_html_from_message(message)
+            preview = compose_post_html("Пример предложения", footer=new_footer)
+            if rich_message_too_long(preview):
+                await message.answer("Фрагмент превышает лимит Rich HTML. Укоротите его и отправьте снова.")
+                return
+            try:
+                await send_rich_html(bot, chat_id=message.chat.id, content=preview)
+            except Exception as exc:
+                logger.info("Child footer preview rejected (%s)", type(exc).__name__)
+                await message.answer("Telegram не принял HTML. Исправьте разметку и отправьте фрагмент ещё раз.")
+                return
+            await state.update_data(pending_footer=new_footer)
+            await state.set_state(ChangeFooter.waiting_for_confirmation)
             await message.answer(
-                f"✅ <b>Оформление обновлено!</b>\n\n"
-                f"<b>Новое оформление:</b>\n<code>{new_footer}</code>\n\n"
-                f"Оно будет добавляться в самом низу каждого одобренного поста в канале.\n\n"
-                f"<b>Пример:</b>\n"
-                f"Пост: \"Текст поста\"\n\n"
-                f"{new_footer}",
-                parse_mode="HTML"
+                "Предпросмотр выше. Сохранить оформление?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Сохранить", callback_data="child_footer_save")],
+                    [InlineKeyboardButton(text="✏️ Изменить", callback_data="child_footer_edit")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="child_footer_cancel")],
+                ]),
             )
-            await state.clear()
+
+        @dp.callback_query(F.data.startswith("child_footer_"))
+        async def confirm_footer_fsm(callback: types.CallbackQuery, state: FSMContext):
+            sub_bot_data = await self.db.get_sub_bot_by_token(bot.token)
+            if not sub_bot_data or callback.from_user.id != sub_bot_data["owner_id"]:
+                await callback.answer("Нет доступа", show_alert=True)
+                return
+            action = callback.data.removeprefix("child_footer_")
+            data = await state.get_data()
+            if action == "save" and await state.get_state() == ChangeFooter.waiting_for_confirmation.state:
+                await self.db.update_post_footer(sub_bot_id, data.get("pending_footer"))
+                await callback.message.edit_text("✅ Rich HTML оформление сохранено.")
+                await state.clear()
+            elif action == "edit":
+                await state.set_state(ChangeFooter.waiting_for_footer)
+                await callback.message.edit_text("Отправьте изменённый фрагмент Rich HTML.")
+            elif action == "cancel":
+                await state.clear()
+                await callback.message.edit_text("Изменение оформления отменено.")
+            await callback.answer()
         
         # ========== ОФОРМЛЕНИЕ СВЕРХУ (HEADER) ==========
         @dp.message(F.text == "📝 Оформление сверху")
@@ -1658,11 +1700,10 @@ class SubBotManager:
                 await state.clear()
                 return
             
-            new_header = (
-                entities_to_rich_html(message.text or "", message.entities)
-                if message.entities
-                else message.text
-            )
+            if not (message.text or message.caption):
+                await message.answer("Отправьте текст или подпись с оформлением.")
+                return
+            new_header = rich_html_from_message(message)
             
             # Спрашиваем про режим
             await state.update_data(new_header=new_header)
@@ -1705,18 +1746,57 @@ class SubBotManager:
                 return
             
             # Сохраняем header и mode
-            await self.db.update_post_header(sub_bot_id, new_header, mode)
-            
             mode_text = "в одну строку с постом" if mode == 'inline' else "на отдельной строке"
-            
-            await callback.message.edit_text(
-                f"✅ <b>Оформление сверху обновлено!</b>\n\n"
-                f"<b>Оформление:</b>\n<code>{new_header}</code>\n"
-                f"<b>Режим:</b> {mode_text}",
-                parse_mode="HTML"
+            preview = compose_post_html(
+                "Пример предложения",
+                header=new_header,
+                footer=sub_bot_data.get("post_footer"),
+                header_mode=mode,
             )
-            await callback.answer("✅ Сохранено")
-            await state.clear()
+            if rich_message_too_long(preview):
+                await callback.answer("Фрагмент превышает лимит Rich HTML", show_alert=True)
+                return
+            try:
+                await send_rich_html(bot, chat_id=callback.message.chat.id, content=preview)
+            except Exception as exc:
+                logger.info("Child header preview rejected (%s)", type(exc).__name__)
+                await callback.answer("Telegram не принял разметку. Исправьте её и попробуйте снова.", show_alert=True)
+                return
+            await state.update_data(pending_header=new_header, pending_header_mode=mode)
+            await state.set_state(ChangeHeader.waiting_for_confirmation)
+            await callback.message.edit_text(
+                f"Предпросмотр выше. Сохранить оформление сверху ({mode_text})?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Сохранить", callback_data="child_header_save")],
+                    [InlineKeyboardButton(text="✏️ Изменить", callback_data="child_header_edit")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="child_header_cancel")],
+                ]),
+            )
+            await callback.answer()
+
+        @dp.callback_query(F.data.startswith("child_header_"))
+        async def confirm_header_fsm(callback: types.CallbackQuery, state: FSMContext):
+            sub_bot_data = await self.db.get_sub_bot_by_token(bot.token)
+            if not sub_bot_data or callback.from_user.id != sub_bot_data["owner_id"]:
+                await callback.answer("Нет доступа", show_alert=True)
+                return
+            action = callback.data.removeprefix("child_header_")
+            data = await state.get_data()
+            if action == "save" and await state.get_state() == ChangeHeader.waiting_for_confirmation.state:
+                await self.db.update_post_header(
+                    sub_bot_id,
+                    data.get("pending_header"),
+                    data.get("pending_header_mode", "newline"),
+                )
+                await callback.message.edit_text("✅ Rich HTML оформление сверху сохранено.")
+                await state.clear()
+            elif action == "edit":
+                await state.set_state(ChangeHeader.waiting_for_header)
+                await callback.message.edit_text("Отправьте изменённый фрагмент Rich HTML.")
+            elif action == "cancel":
+                await state.clear()
+                await callback.message.edit_text("Изменение оформления отменено.")
+            await callback.answer()
         
         @dp.callback_query(F.data == "header_remove")
         async def remove_header(callback: types.CallbackQuery, state: FSMContext):
@@ -2607,95 +2687,45 @@ class SubBotManager:
                     # ПУБЛИКАЦИЯ В КАНАЛ
                     channel_id = sub_bot_data['channel_id']
                     post_footer = sub_bot_data.get('post_footer')
+                    post_header = sub_bot_data.get('post_header')
+                    header_mode = sub_bot_data.get('header_mode', 'newline')
                 
                     try:
-                        # Очистка текста от метаданных (на всякий случай)
                         user_text = original_text
-                    
-                        # Добавляем footer
-                        if post_footer:
-                            if user_text:
-                                final_text = user_text + "\n\n" + post_footer
-                            else:
-                                final_text = post_footer
-                        else:
-                            final_text = user_text
-                    
-                        # Определяем, есть ли валидное HTML форматирование
-                        has_html_formatting = final_text and self._is_valid_html(final_text)
-                        
-                        # Публикация
+                        rich_post_html = compose_post_html(
+                            user_text,
+                            original_entities or [],
+                            header=post_header,
+                            footer=post_footer,
+                            header_mode=header_mode,
+                        )
+                        has_rich_only_tags = requires_rich_message(rich_post_html)
+                        final_caption_html = self._build_html_caption(
+                            header=post_header,
+                            header_mode=header_mode,
+                            user_caption=user_text,
+                            footer=post_footer,
+                            user_entities=original_entities or [],
+                        )
+
                         if content_type == 'text':
-                            await bot.send_message(
-                                chat_id=channel_id, 
-                                text=final_text,
-                                parse_mode="HTML" if has_html_formatting else None,
-                                disable_web_page_preview=True if has_html_formatting else None
+                            await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
+                        elif content_type in {'photo', 'video', 'document', 'audio', 'animation'}:
+                            caption = "" if has_rich_only_tags else final_caption_html
+                            copied = await bot.copy_message(
+                                chat_id=channel_id,
+                                from_chat_id=message.chat.id,
+                                message_id=message.message_id,
+                                caption=caption,
+                                parse_mode="HTML" if not has_rich_only_tags and self._is_valid_html(final_caption_html) else None,
                             )
-                        elif content_type == 'photo':
-                            await bot.copy_message(
-                                chat_id=channel_id, 
-                                from_chat_id=message.chat.id, 
-                                message_id=message.message_id, 
-                                caption=final_text, 
-                                parse_mode="HTML" if has_html_formatting else None
-                            )
-                        elif content_type == 'video':
-                            await bot.copy_message(
-                                chat_id=channel_id, 
-                                from_chat_id=message.chat.id, 
-                                message_id=message.message_id, 
-                                caption=final_text, 
-                                parse_mode="HTML" if has_html_formatting else None
-                            )
-                        elif content_type == 'document':
-                            await bot.copy_message(
-                                chat_id=channel_id, 
-                                from_chat_id=message.chat.id, 
-                                message_id=message.message_id, 
-                                caption=final_text, 
-                                parse_mode="HTML" if has_html_formatting else None
-                            )
-                        elif content_type == 'audio':
-                            await bot.copy_message(
-                                chat_id=channel_id, 
-                                from_chat_id=message.chat.id, 
-                                message_id=message.message_id, 
-                                caption=final_text, 
-                                parse_mode="HTML" if has_html_formatting else None
-                            )
-                        elif content_type == 'animation':
-                            await bot.copy_message(
-                                chat_id=channel_id, 
-                                from_chat_id=message.chat.id, 
-                                message_id=message.message_id, 
-                                caption=final_text, 
-                                parse_mode="HTML" if has_html_formatting else None
-                            )
-                        elif content_type == 'voice':
-                            msg = await bot.copy_message(chat_id=channel_id, from_chat_id=message.chat.id, message_id=message.message_id)
-                            if post_footer:
-                                has_html_in_footer = self._is_valid_html(post_footer)
-                                await bot.send_message(
-                                    chat_id=channel_id, 
-                                    text=post_footer, 
-                                    reply_to_message_id=msg.message_id, 
-                                    parse_mode="HTML" if has_html_in_footer else None,
-                                    disable_web_page_preview=True if has_html_in_footer else None
-                                )
+                            if has_rich_only_tags:
+                                await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
                         else:
-                            # Fallback
                             msg = await bot.copy_message(chat_id=channel_id, from_chat_id=message.chat.id, message_id=message.message_id)
-                            if post_footer:
-                                has_html_in_footer = self._is_valid_html(post_footer)
-                                await bot.send_message(
-                                    chat_id=channel_id, 
-                                    text=post_footer, 
-                                    reply_to_message_id=msg.message_id, 
-                                    parse_mode="HTML" if has_html_in_footer else None,
-                                    disable_web_page_preview=True if has_html_in_footer else None
-                                )
-                            
+                            if post_header or post_footer or user_text:
+                                await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
+
                         # Уведомление пользователю
                         await message.answer("✅ Ваше предложение опубликовано в канале!")
                     
@@ -2874,6 +2904,15 @@ class SubBotManager:
                             current_text = '\n\n'.join(caption_parts) if caption_parts else ""
                             if not self._text_contains_at_end(current_text, post_footer, allow_separators=True):
                                 caption_parts.append(post_footer)
+
+                        rich_post_html = compose_post_html(
+                            user_caption,
+                            original_entities or [],
+                            header=post_header,
+                            footer=post_footer,
+                            header_mode=header_mode,
+                        )
+                        rich_caption_separate = requires_rich_message(rich_post_html)
                         
                         if caption_parts:
                             caption = "\n\n".join(caption_parts)
@@ -2892,28 +2931,28 @@ class SubBotManager:
                                     if media_type == 'photo':
                                         media_items.append(InputMediaPhoto(
                                             media=file_id,
-                                            caption=caption if len(media_items) == 0 else None,
-                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html else None,
+                                            caption=("" if rich_caption_separate else caption) if len(media_items) == 0 else None,
+                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html and not rich_caption_separate else None,
                                             has_spoiler=has_spoiler if len(media_items) == 0 else False
                                         ))
                                     elif media_type == 'video':
                                         media_items.append(InputMediaVideo(
                                             media=file_id,
-                                            caption=caption if len(media_items) == 0 else None,
-                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html else None,
+                                            caption=("" if rich_caption_separate else caption) if len(media_items) == 0 else None,
+                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html and not rich_caption_separate else None,
                                             has_spoiler=has_spoiler if len(media_items) == 0 else False
                                         ))
                                     elif media_type == 'document':
                                         media_items.append(InputMediaDocument(
                                             media=file_id,
-                                            caption=caption if len(media_items) == 0 else None,
-                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html else None
+                                            caption=("" if rich_caption_separate else caption) if len(media_items) == 0 else None,
+                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html and not rich_caption_separate else None
                                         ))
                                     elif media_type == 'audio':
                                         media_items.append(InputMediaAudio(
                                             media=file_id,
-                                            caption=caption if len(media_items) == 0 else None,
-                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html else None
+                                            caption=("" if rich_caption_separate else caption) if len(media_items) == 0 else None,
+                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html and not rich_caption_separate else None
                                         ))
                                 except Exception as e:
                                     logger.warning(f"Ошибка парсинга file_id '{file_id_str}': {e}")
@@ -2946,6 +2985,8 @@ class SubBotManager:
                         
                         # КРИТИЧНО: Сразу обновляем статус в БД
                         await self.db.update_message_status(message_db_id, 'published', channel_message.message_id)
+                        if rich_caption_separate and rich_post_html.strip():
+                            await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
                         
                         # Обновляем сообщение в админ-чате (добавляем статус и информацию о том, кто одобрил)
                         approver = callback.from_user
@@ -3250,6 +3291,16 @@ class SubBotManager:
                         footer=post_footer,
                         user_entities=original_entities if original_entities else []
                     )
+                    rich_caption_html = compose_post_html(
+                        user_caption,
+                        original_entities or [],
+                        header=post_header,
+                        footer=post_footer,
+                        header_mode=header_mode,
+                    ) if supports_caption else compose_post_html(
+                        "", header=post_header, footer=post_footer, header_mode=header_mode
+                    )
+                    rich_caption_separate = requires_rich_message(rich_caption_html)
                     
                     try:
                         # КРИТИЧНО: Если есть спойлер, используем send_photo/send_video вместо copy_message
@@ -3273,8 +3324,8 @@ class SubBotManager:
                                 channel_message = await bot.send_photo(
                                     chat_id=channel_id,
                                     photo=file_id,
-                                    caption=final_caption_html if supports_caption else None,
-                                    parse_mode="HTML" if supports_caption else None,
+                                    caption=("" if rich_caption_separate else final_caption_html) if supports_caption else None,
+                                    parse_mode="HTML" if supports_caption and not rich_caption_separate else None,
                                     has_spoiler=True,
                                     disable_web_page_preview=True if supports_caption else None
                                 )
@@ -3288,8 +3339,8 @@ class SubBotManager:
                                 channel_message = await bot.send_video(
                                     chat_id=channel_id,
                                     video=file_id,
-                                    caption=final_caption_html if supports_caption else None,
-                                    parse_mode="HTML" if supports_caption else None,
+                                    caption=("" if rich_caption_separate else final_caption_html) if supports_caption else None,
+                                    parse_mode="HTML" if supports_caption and not rich_caption_separate else None,
                                     has_spoiler=True,
                                     disable_web_page_preview=True if supports_caption else None
                                 )
@@ -3303,8 +3354,8 @@ class SubBotManager:
                                 chat_id=channel_id,
                                 from_chat_id=user_id,
                                 message_id=user_message_id,
-                                caption=final_caption_html if supports_caption else None,
-                                parse_mode="HTML" if supports_caption else None
+                                caption=("" if rich_caption_separate else final_caption_html) if supports_caption else None,
+                                parse_mode="HTML" if supports_caption and not rich_caption_separate else None
                             )
                         logger.info(f"Медиа опубликовано в канал: message_id={channel_message.message_id}, has_spoiler={has_spoiler}")
                     except Exception as e:
@@ -3316,7 +3367,7 @@ class SubBotManager:
                                 from_chat_id=user_id,
                                 message_id=user_message_id
                             )
-                            if supports_caption and final_caption_html:
+                            if supports_caption and final_caption_html and not rich_caption_separate:
                                 await bot.send_message(
                                     chat_id=channel_id,
                                     text=final_caption_html,
@@ -3334,9 +3385,15 @@ class SubBotManager:
                             await callback.answer("❌ Ошибка публикации медиа")
                             await release_claim_if_unpublished()
                             return
+
+                    if rich_caption_separate and rich_caption_html.strip():
+                        try:
+                            await send_rich_html(bot, chat_id=channel_id, content=rich_caption_html)
+                        except Exception as rich_exc:
+                            logger.error("Rich HTML media caption failed after media publish (%s)", type(rich_exc).__name__)
                     
                     # Если есть footer для типов без caption - отправляем отдельным сообщением
-                    if footer_message and not supports_caption:
+                    if footer_message and not supports_caption and not rich_caption_separate:
                         has_html_in_footer_msg = self._is_valid_html(footer_message)
                         await bot.send_message(
                             chat_id=channel_id,
