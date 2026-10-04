@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.git/
+.pre_rebuild/
+.db_archive/
+.db_archive_*/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+data/
+*.log

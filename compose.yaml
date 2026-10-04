@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/bot_constructor.db
+    volumes:
+      - bot_data:/data
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  bot_data:
