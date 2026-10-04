@@ -1292,6 +1292,75 @@ class SubBotManager:
             else:
                 await message.answer(welcome_text, reply_markup=keyboard, parse_mode="HTML")
         
+        @dp.message(Command("setchannel"))
+        async def setup_publication_channel(message: types.Message):
+            """Let the owner bind a channel when Telegram's membership update is missed."""
+            if not message.from_user:
+                return
+            info = await self.db.get_sub_bot_by_id(sub_bot_id)
+            if not info or message.from_user.id != info.get("owner_id"):
+                return
+            if message.chat.type != "private":
+                await message.answer("Откройте личный чат со мной и отправьте команду /setchannel.")
+                return
+
+            args = (message.text or "").split(maxsplit=1)
+            channel = None
+            if len(args) > 1:
+                channel_ref = args[1].strip()
+                if channel_ref.startswith("https://t.me/"):
+                    channel_ref = "@" + channel_ref.removeprefix("https://t.me/").strip("/")
+                try:
+                    channel = await bot.get_chat(channel_ref)
+                except Exception:
+                    await message.answer(
+                        "Не нашёл канал. Укажите публичный @username или ID канала, например -1001234567890."
+                    )
+                    return
+            else:
+                forwarded = message.reply_to_message or message
+                origin = getattr(forwarded, "forward_origin", None)
+                if origin and getattr(origin, "type", None) == "channel":
+                    channel = origin.chat
+                else:
+                    channel = getattr(forwarded, "forward_from_chat", None)
+
+            if not channel:
+                await message.answer(
+                    "Для публичного канала отправьте /setchannel @username. Для закрытого канала "
+                    "перешлите мне пост из него и ответьте на пересланный пост командой /setchannel."
+                )
+                return
+            if channel.type != "channel":
+                await message.answer("Указанный чат не является каналом.")
+                return
+
+            try:
+                bot_member = await bot.get_chat_member(channel.id, bot.id)
+            except Exception:
+                await message.answer(
+                    "Не удалось проверить канал. Добавьте меня туда администратором с правом публиковать сообщения."
+                )
+                return
+            if bot_member.status != "administrator" or not getattr(bot_member, "can_post_messages", False):
+                await message.answer(
+                    "Я должен быть администратором этого канала с правом публиковать сообщения. "
+                    "Выдайте это право и отправьте /setchannel ещё раз."
+                )
+                return
+
+            link = (
+                f"https://t.me/{channel.username}"
+                if getattr(channel, "username", None)
+                else f"Канал: {channel.title} (ID: {channel.id})"
+            )
+            await self.db.update_sub_bot_chats(
+                sub_bot_id=sub_bot_id, channel_id=channel.id, channel_link=link
+            )
+            await message.answer(
+                f"✅ Канал «{channel.title}» подключён. Вернитесь в панель конструктора и обновите статус."
+            )
+
         # ========== ПОДТВЕРЖДЕНИЕ ПРИВЯЗКИ ЧАТА ВЛАДЕЛЬЦЕМ ==========
         @dp.message(Command("setup"))
         async def setup_moderation_group(message: types.Message):
@@ -1326,6 +1395,13 @@ class SubBotManager:
         async def on_chat_member_updated(update: types.ChatMemberUpdated):
             """Never let a group member silently replace the moderation route."""
             chat = update.chat
+            logger.info(
+                "Sub-bot %s membership update: type=%s status=%s actor=%s",
+                sub_bot_id,
+                chat.type,
+                update.new_chat_member.status,
+                update.from_user.id if update.from_user else None,
+            )
             if chat.type not in {"group", "supergroup", "channel"}:
                 return
             info = await self.db.get_sub_bot_by_id(sub_bot_id)
