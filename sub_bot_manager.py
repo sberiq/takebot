@@ -2791,7 +2791,7 @@ class SubBotManager:
                     
                     full_caption, full_entities = self._combine_parts([header_part, user_part, sender_part])
                     
-                    if len(full_caption) <= 1024:
+                    if self._get_utf16_length(full_caption) <= 1024:
                         admin_message = await bot.copy_message(
                             chat_id=admin_chat_id,
                             from_chat_id=message.chat.id,
@@ -3103,54 +3103,6 @@ class SubBotManager:
                         media_items = []
                         user_caption = original_text_from_db if original_text_from_db else ""
                         
-                        # Очистка caption
-                        if user_caption:
-                            lines = user_caption.split('\n')
-                            cleaned_lines = []
-                            for line in lines:
-                                line_clean = line.strip()
-                                if any(marker in line_clean for marker in ['🆔 ID:', '📱 Username:', '👤 От:', '━━━━━━━━━━━━━━━', '📬', 'Анонимно', '✅ ОПУБЛИКОВАНО']):
-                                    continue
-                                cleaned_lines.append(line)
-                            user_caption = '\n'.join(cleaned_lines).strip()
-                        
-                        # КРИТИЧНО: Удаляем дубликаты header/footer если они уже есть в тексте
-                        user_caption = self._remove_duplicate_header_footer(
-                            user_caption, 
-                            header=post_header, 
-                            footer=post_footer, 
-                            header_mode=header_mode
-                        )
-                        
-                        # Формируем caption с header и footer
-                        caption_parts = []
-                        
-                        # Header сверху (добавляем только если его еще нет)
-                        if post_header:
-                            # Проверяем, есть ли header уже в начале
-                            if not self._text_contains_at_start(user_caption, post_header, allow_separators=(header_mode == 'newline')):
-                                if header_mode == 'inline' and user_caption:
-                                    # Inline: header + пробел + текст
-                                    caption_parts.append(post_header + " " + user_caption)
-                                else:
-                                    # Newline: header на отдельной строке
-                                    caption_parts.append(post_header)
-                                    if user_caption:
-                                        caption_parts.append(user_caption)
-                            else:
-                                # Header уже есть - добавляем только текст
-                                if user_caption:
-                                    caption_parts.append(user_caption)
-                        elif user_caption:
-                            caption_parts.append(user_caption)
-                        
-                        # Footer снизу (добавляем только если его еще нет)
-                        if post_footer:
-                            # Проверяем, есть ли footer уже в конце
-                            current_text = '\n\n'.join(caption_parts) if caption_parts else ""
-                            if not self._text_contains_at_end(current_text, post_footer, allow_separators=True):
-                                caption_parts.append(post_footer)
-
                         rich_post_html = compose_post_html(
                             user_caption,
                             original_entities or [],
@@ -3159,51 +3111,56 @@ class SubBotManager:
                             header_mode=header_mode,
                         )
                         rich_caption_separate = requires_rich_message(rich_post_html)
-                        
-                        if caption_parts:
-                            caption = "\n\n".join(caption_parts)
-                        else:
-                            caption = None
-                        
-                        # КРИТИЧНО: Проверяем валидность HTML в caption перед использованием
-                        has_valid_html = caption and self._is_valid_html(caption)
-                        
+                        caption = self._build_html_caption(
+                            header=post_header,
+                            header_mode=header_mode,
+                            user_caption=user_caption,
+                            footer=post_footer,
+                            user_entities=original_entities or [],
+                        ) or None
+                        if caption and self._get_utf16_length(caption) > 1024:
+                            rich_caption_separate = True
+                        has_valid_html = bool(caption and self._is_valid_html(caption))
+
                         # Парсим file_id из строки формата "type:file_id"
                         for file_id_str in group_file_ids_str.split(','):
                             file_id_str = file_id_str.strip()
-                            if ':' in file_id_str:
-                                try:
-                                    media_type, file_id = file_id_str.split(':', 1)
-                                    if media_type == 'photo':
-                                        media_items.append(InputMediaPhoto(
-                                            media=file_id,
-                                            caption=("" if rich_caption_separate else caption) if len(media_items) == 0 else None,
-                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html and not rich_caption_separate else None,
-                                            has_spoiler=has_spoiler if len(media_items) == 0 else False
-                                        ))
-                                    elif media_type == 'video':
-                                        media_items.append(InputMediaVideo(
-                                            media=file_id,
-                                            caption=("" if rich_caption_separate else caption) if len(media_items) == 0 else None,
-                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html and not rich_caption_separate else None,
-                                            has_spoiler=has_spoiler if len(media_items) == 0 else False
-                                        ))
-                                    elif media_type == 'document':
-                                        media_items.append(InputMediaDocument(
-                                            media=file_id,
-                                            caption=("" if rich_caption_separate else caption) if len(media_items) == 0 else None,
-                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html and not rich_caption_separate else None
-                                        ))
-                                    elif media_type == 'audio':
-                                        media_items.append(InputMediaAudio(
-                                            media=file_id,
-                                            caption=("" if rich_caption_separate else caption) if len(media_items) == 0 else None,
-                                            parse_mode="HTML" if len(media_items) == 0 and has_valid_html and not rich_caption_separate else None
-                                        ))
-                                except Exception as e:
-                                    logger.warning(f"Ошибка парсинга file_id '{file_id_str}': {e}")
-                                    continue
-                        
+                            if ':' not in file_id_str:
+                                raise ValueError("Некорректный идентификатор медиа в альбоме")
+                            media_type, file_id = file_id_str.split(':', 1)
+                            if not file_id:
+                                raise ValueError("Пустой file_id в альбоме")
+                            item_caption = ("" if rich_caption_separate else caption) if not media_items else None
+                            item_parse_mode = "HTML" if not media_items and has_valid_html and not rich_caption_separate else None
+                            if media_type == 'photo':
+                                media_items.append(InputMediaPhoto(
+                                    media=file_id,
+                                    caption=item_caption,
+                                    parse_mode=item_parse_mode,
+                                    has_spoiler=has_spoiler if not media_items else False,
+                                ))
+                            elif media_type == 'video':
+                                media_items.append(InputMediaVideo(
+                                    media=file_id,
+                                    caption=item_caption,
+                                    parse_mode=item_parse_mode,
+                                    has_spoiler=has_spoiler if not media_items else False,
+                                ))
+                            elif media_type == 'document':
+                                media_items.append(InputMediaDocument(
+                                    media=file_id,
+                                    caption=item_caption,
+                                    parse_mode=item_parse_mode,
+                                ))
+                            elif media_type == 'audio':
+                                media_items.append(InputMediaAudio(
+                                    media=file_id,
+                                    caption=item_caption,
+                                    parse_mode=item_parse_mode,
+                                ))
+                            else:
+                                raise ValueError(f"Unsupported media type in album: {media_type}")
+
                         if not media_items:
                             logger.error("Не удалось распарсить file_id из медиа-группы")
                             try:
@@ -3219,10 +3176,7 @@ class SubBotManager:
                         
                         # КРИТИЧНО: Отправляем медиа-группу в канал
                         # Все медиа будут отправлены как один альбом
-                        sent_messages = await bot.send_media_group(
-                            chat_id=channel_id,
-                            media=media_items
-                        )
+                        sent_messages = await self._send_media_items(bot, channel_id, media_items)
                         
                         # Первое сообщение - основное
                         channel_message = sent_messages[0]
