@@ -408,9 +408,9 @@ async def create_bot_start(message: types.Message, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     intro = (
-        "<b>Добавление бота</b>\\n\\n"
+        "<b>Добавление бота</b>\n\n"
         "Можно создать бота вручную через @BotFather и подключить его токеном. "
-        "Этот способ работает и без Bot Management Mode.\\n\\n"
+        "Этот способ работает и без Bot Management Mode.\n\n"
         "Если Telegram разрешил основному боту управлять созданием ботов, выше также появится "
         "вариант автоматического создания без копирования токена."
     )
@@ -422,11 +422,11 @@ async def create_bot_start(message: types.Message, state: FSMContext):
 async def connect_existing_bot(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(BotRegistration.waiting_for_token)
     await callback.message.edit_text(
-        "<b>Создайте своего бота и подключите его</b>\\n\\n"
-        "1. Откройте @BotFather и отправьте <code>/newbot</code>.\\n"
-        "2. Задайте имя и username нового бота.\\n"
-        "3. Скопируйте выданный токен и вернитесь сюда.\\n"
-        "4. Отправьте токен одним сообщением.\\n\\n"
+        "<b>Создайте своего бота и подключите его</b>\n\n"
+        "1. Откройте @BotFather и отправьте <code>/newbot</code>.\n"
+        "2. Задайте имя и username нового бота.\n"
+        "3. Скопируйте выданный токен и вернитесь сюда.\n"
+        "4. Отправьте токен одним сообщением.\n\n"
         "Я проверю токен и удалю сообщение из этого чата. Сам бот будет работать на этом экземпляре конструктора.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🤖 Открыть @BotFather", url="https://t.me/BotFather"),
@@ -586,7 +586,7 @@ async def process_footer_choice(callback: types.CallbackQuery, state: FSMContext
 async def process_footer_text(message: types.Message, state: FSMContext):
     """Preview Rich HTML before keeping it as the post footer."""
     footer_text = rich_html_from_message(message)
-    if not (message.text or message.caption):
+    if not footer_text.strip():
         await message.answer("Пришлите текст или подпись к сообщению с оформлением.")
         return
     if not await send_rich_format_preview(message.chat.id, footer=footer_text):
@@ -2199,10 +2199,10 @@ async def process_sub_bot_footer(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    if message.chat.type != "private" or not (message.text or message.caption):
+    new_footer = rich_html_from_message(message)
+    if message.chat.type != "private" or not new_footer.strip():
         await message.answer("Пришлите текст оформления в личном чате с конструктором.")
         return
-    new_footer = rich_html_from_message(message)
     if not await send_rich_format_preview(
         message.chat.id,
         header=sub_bot_data.get("post_header"),
@@ -2502,8 +2502,8 @@ async def process_sub_bot_header(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    # Используем HTML текст для поддержки форматирования
-    if not (message.text or message.caption):
+    # Rich Messages may populate rich_message without text/caption.
+    if not rich_html_from_message(message).strip():
         await message.answer("Пришлите текст оформления.")
         return
     new_header = rich_html_from_message(message)
@@ -2577,7 +2577,7 @@ async def process_sub_bot_welcome(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    if not (message.text or message.caption):
+    if not rich_html_from_message(message).strip():
         await message.answer("Пришлите текст приветствия.")
         return
     pending_welcome = rich_html_from_message(message)
