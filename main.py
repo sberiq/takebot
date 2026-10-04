@@ -1956,6 +1956,9 @@ async def show_sub_bot_setup(callback: types.CallbackQuery):
         "Затем нажмите обновление статуса.\n\n"
         f"2. <b>Канал публикаций:</b> {channel_status}\n"
         "Добавьте бота в канал администратором с правом <b>публиковать сообщения</b>.\n\n"
+        "Если канал не появился в панели, откройте бота и нажмите Start. Для публичного канала "
+        "отправьте ему <code>/setchannel @username</code>. Для закрытого канала перешлите боту "
+        "пост из канала и ответьте на него командой <code>/setchannel</code>.\n\n"
         "Если вы добавляете бота сами, привязка сохранится автоматически. Если добавил другой "
         "администратор, бот пришлёт вам запрос на подтверждение. После подключения обоих чатов "
         "пользователи смогут писать боту в личные сообщения."
@@ -1966,6 +1969,10 @@ async def show_sub_bot_setup(callback: types.CallbackQuery):
         rows.append([InlineKeyboardButton(
             text="➕ Добавить в группу",
             url=f"https://t.me/{bot_username}?startgroup=start",
+        )])
+        rows.append([InlineKeyboardButton(
+            text="↗️ Открыть бота",
+            url=f"https://t.me/{bot_username}",
         )])
     rows.extend([
         [InlineKeyboardButton(text="🔄 Обновить статусы", callback_data=f"subbot_settings_{sub_bot_id}")],
