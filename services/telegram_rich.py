@@ -114,11 +114,158 @@ def rich_html_from_message(message: types.Message) -> str:
     """Convert Telegram text formatting to Rich HTML, or accept explicitly typed HTML."""
     source = message.text or message.caption or ""
     entities = message.entities or message.caption_entities
-    if entities:
+    if source and entities:
         return entities_to_rich_html(source, entities)
-    if re.search(r"</?[A-Za-z][^>]*>", source):
+    if source and re.search(r"</?[A-Za-z][^>]*>", source):
         return source
-    return html.escape(source, quote=False)
+    if source:
+        return html.escape(source, quote=False)
+
+    # Telegram Bot API 10.1+ may deliver content composed in its rich editor
+    # through Message.rich_message, with neither text nor caption populated.
+    # aiogram versions that do not model the field preserve it in model_extra.
+    rich_message = getattr(message, "rich_message", None)
+    if rich_message is None:
+        rich_message = (getattr(message, "model_extra", None) or {}).get("rich_message")
+    return _rich_message_to_html(rich_message)
+
+
+def _as_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        result = dump(mode="python", exclude_none=True)
+        return result if isinstance(result, dict) else {}
+    legacy_dump = getattr(value, "dict", None)
+    if callable(legacy_dump):
+        result = legacy_dump(exclude_none=True)
+        return result if isinstance(result, dict) else {}
+    return {}
+
+
+def _rich_text_to_html(value: Any) -> str:
+    if isinstance(value, str):
+        return html.escape(value, quote=False)
+    if isinstance(value, (list, tuple)):
+        return "".join(_rich_text_to_html(item) for item in value)
+
+    data = _as_mapping(value)
+    if not data:
+        return ""
+    kind = str(data.get("type", "")).lower()
+    body = _rich_text_to_html(data.get("text", data.get("children", "")))
+    tags = {
+        "bold": ("<b>", "</b>"),
+        "italic": ("<i>", "</i>"),
+        "underline": ("<u>", "</u>"),
+        "strikethrough": ("<s>", "</s>"),
+        "spoiler": ("<tg-spoiler>", "</tg-spoiler>"),
+        "marked": ("<mark>", "</mark>"),
+        "subscript": ("<sub>", "</sub>"),
+        "superscript": ("<sup>", "</sup>"),
+        "code": ("<code>", "</code>"),
+    }
+    if kind in tags:
+        return tags[kind][0] + body + tags[kind][1]
+    if kind == "url":
+        url = data.get("url")
+        return f'<a href="{html.escape(str(url), quote=True)}">{body}</a>' if url else body
+    if kind in {"email_address", "email"}:
+        address = data.get("email_address") or data.get("email")
+        return f'<a href="mailto:{html.escape(str(address), quote=True)}">{body or html.escape(str(address))}</a>' if address else body
+    if kind in {"phone_number", "phone"}:
+        phone = data.get("phone_number") or data.get("phone")
+        return f'<a href="tel:{html.escape(str(phone), quote=True)}">{body or html.escape(str(phone))}</a>' if phone else body
+    if kind == "text_mention":
+        user_id = data.get("user_id")
+        user = _as_mapping(data.get("user"))
+        user_id = user_id or user.get("id")
+        return f'<a href="tg://user?id={html.escape(str(user_id), quote=True)}">{body}</a>' if user_id else body
+    if kind == "custom_emoji":
+        emoji_id = data.get("custom_emoji_id") or data.get("emoji_id")
+        alternative = data.get("alternative_text") or data.get("alt") or body
+        if emoji_id:
+            return f'<tg-emoji emoji-id="{html.escape(str(emoji_id), quote=True)}">{alternative}</tg-emoji>'
+        return alternative
+    if kind == "pre":
+        language = data.get("language")
+        code = f'<code class="language-{html.escape(str(language), quote=True)}">{body}</code>' if language else body
+        return f"<pre>{code}</pre>"
+    if kind in {"hashtag", "cashtag", "mention", "bot_command", "date_time", "anchor", "reference"}:
+        return body or html.escape(str(data.get("text", "")), quote=False)
+    # Unknown rich text types should degrade to readable text, never disappear.
+    if body:
+        return body
+    for key in ("alternative_text", "email_address", "phone_number", "url"):
+        if data.get(key):
+            return html.escape(str(data[key]), quote=False)
+    return ""
+
+
+def _rich_block_to_html(value: Any) -> str:
+    data = _as_mapping(value)
+    if not data:
+        return _rich_text_to_html(value)
+    kind = str(data.get("type", "")).lower()
+    if kind in {"paragraph", "heading", "pre", "divider", "blockquote", "quotation", "block_quotation", "expandable_blockquote", "pullquote", "details", "list", "table"}:
+        if kind == "divider":
+            return "<hr/>"
+        if kind == "heading":
+            try:
+                size = min(6, max(1, int(data.get("size", 2))))
+            except (TypeError, ValueError):
+                size = 2
+            return f"<h{size}>{_rich_text_to_html(data.get('text', ''))}</h{size}>"
+        if kind == "pre":
+            return _rich_text_to_html({"type": "pre", "text": data.get("text", ""), "language": data.get("language")})
+        if kind in {"blockquote", "quotation", "block_quotation"}:
+            return f"<blockquote>{_rich_text_to_html(data.get('text', ''))}</blockquote>"
+        if kind == "expandable_blockquote":
+            return f"<blockquote expandable>{_rich_text_to_html(data.get('text', ''))}</blockquote>"
+        if kind == "pullquote":
+            return f"<blockquote>{_rich_text_to_html(data.get('text', ''))}</blockquote>"
+        if kind == "details":
+            summary = _rich_text_to_html(data.get("summary", ""))
+            blocks = "".join(_rich_block_to_html(item) for item in data.get("blocks", []))
+            return f"<details><summary>{summary}</summary>{blocks}</details>"
+        if kind == "list":
+            items = []
+            for item in data.get("items", []):
+                item_data = _as_mapping(item)
+                content = "".join(_rich_block_to_html(part) for part in item_data.get("blocks", []))
+                if not content:
+                    content = _rich_text_to_html(item_data.get("text", item))
+                items.append(f"<li>{content}</li>")
+            return "<ul>" + "".join(items) + "</ul>"
+        if kind == "table":
+            rows = data.get("rows", data.get("cells", []))
+            rendered_rows = []
+            for row in rows:
+                cells = row if isinstance(row, (list, tuple)) else _as_mapping(row).get("cells", [])
+                rendered_cells = []
+                for cell in cells:
+                    cell_data = _as_mapping(cell)
+                    tag = "th" if cell_data.get("is_header") else "td"
+                    rendered_cells.append(f"<{tag}>{_rich_text_to_html(cell_data.get('text', cell))}</{tag}>")
+                rendered_rows.append("<tr>" + "".join(rendered_cells) + "</tr>")
+            return "<table>" + "".join(rendered_rows) + "</table>"
+        return f"<p>{_rich_text_to_html(data.get('text', ''))}</p>"
+
+    # Unknown block types can still contain useful text in nested fields.
+    if data.get("text") is not None:
+        return f"<p>{_rich_text_to_html(data['text'])}</p>"
+    if data.get("blocks"):
+        return "".join(_rich_block_to_html(item) for item in data["blocks"])
+    return ""
+
+
+def _rich_message_to_html(value: Any) -> str:
+    data = _as_mapping(value)
+    if not data:
+        return ""
+    blocks = data.get("blocks") or []
+    return "".join(_rich_block_to_html(block) for block in blocks)
 
 
 def rich_message_too_long(content: str) -> bool:
@@ -148,7 +295,7 @@ def _configured_fragment(fragment: str | None) -> str:
         return ""
     # The owner explicitly sets these fragments in bot settings. Rich HTML parsing
     # is still performed by Telegram; text from submitters always uses escaping.
-    if "<" in fragment and ">" in fragment:
+    if _HTML_TAG_RE.search(fragment) or html.unescape(fragment) != fragment:
         return fragment
     return html.escape(fragment, quote=False)
 
