@@ -107,6 +107,7 @@ class SubBotManager:
         self.dispatchers: Dict[int, Dispatcher] = {}  # sub_bot_id: Dispatcher
         self.tasks: Dict[int, asyncio.Task] = {}  # sub_bot_id: Task
         self.media_groups: Dict[str, list] = {}  # media_group_id: [messages]
+        self.media_group_last_seen: Dict[str, float] = {}
         self.user_message_windows: Dict[tuple[int, int], deque] = {}
         self.media_group_rate_keys: Dict[tuple[int, int, str], float] = {}
         self.manager_username: str | None = None
@@ -200,7 +201,11 @@ class SubBotManager:
         if not bot_info or callback.message.chat.id != bot_info.get("admin_chat_id"):
             return None, None, "Действие доступно только в настроенном чате модерации"
         item = await self.db.get_message_by_id(message_db_id, sub_bot_id=sub_bot_id)
-        if not item or item.get("admin_message_id") != callback.message.message_id:
+        valid_card_ids = {
+            item.get("admin_message_id") if item else None,
+            item.get("moderation_message_id") if item else None,
+        }
+        if not item or callback.message.message_id not in valid_card_ids:
             return None, None, "Заявка не принадлежит этому сообщению"
         if callback.from_user.id != bot_info["owner_id"]:
             try:
@@ -325,6 +330,54 @@ class SubBotManager:
         # Разделяем абзацами через \n\n, чтобы избежать ошибок parse_mode на <br>
         return "\n\n".join(parts)
     
+    async def _send_media_items(self, bot: Bot, chat_id: int, media_items: list) -> list[types.Message]:
+        """Send an album, or its single-item fallback when Telegram delivers only one part."""
+        if not media_items:
+            raise ValueError("No supported media items")
+        if len(media_items) > 1:
+            return await bot.send_media_group(chat_id=chat_id, media=media_items)
+
+        item = media_items[0]
+        common = {
+            "chat_id": chat_id,
+            "caption": item.caption,
+            "caption_entities": item.caption_entities,
+            "parse_mode": item.parse_mode,
+        }
+        if item.type == "photo":
+            sent = await bot.send_photo(
+                photo=item.media,
+                has_spoiler=getattr(item, "has_spoiler", False),
+                **common,
+            )
+        elif item.type == "video":
+            sent = await bot.send_video(
+                video=item.media,
+                width=item.width,
+                height=item.height,
+                duration=item.duration,
+                supports_streaming=item.supports_streaming,
+                has_spoiler=getattr(item, "has_spoiler", False),
+                **common,
+            )
+        elif item.type == "document":
+            sent = await bot.send_document(
+                document=item.media,
+                disable_content_type_detection=item.disable_content_type_detection,
+                **common,
+            )
+        elif item.type == "audio":
+            sent = await bot.send_audio(
+                audio=item.media,
+                duration=item.duration,
+                performer=item.performer,
+                title=item.title,
+                **common,
+            )
+        else:
+            raise ValueError(f"Unsupported media type: {item.type}")
+        return [sent]
+
     def _text_contains_at_start(self, text: str, pattern: str, allow_separators: bool = True) -> bool:
         """
         Проверяет, содержит ли текст pattern в начале (БЕЗ нормализации, сохраняет ВСЕ символы включая невидимые)
@@ -649,46 +702,43 @@ class SubBotManager:
     async def _process_media_group_delayed(self, bot: Bot, sub_bot_id: int, user_id: int,
                                           is_anonymous: bool, admin_chat_id: int,
                                           group_key: str, state: FSMContext):
-        """Обработка медиа-группы с задержкой для сбора всех сообщений"""
-        # Ждем 5 секунд для получения всех сообщений группы (увеличено для надежности)
-        await asyncio.sleep(5.0)
-        
-        # Проверяем, что группа еще существует
+        """Wait for a quiet interval so all Telegram album parts are collected."""
+        started_at = time.monotonic()
+        deadline = time.monotonic() + 15.0
+        while group_key in self.media_groups:
+            await asyncio.sleep(0.75)
+            now = time.monotonic()
+            last_seen = self.media_group_last_seen.get(group_key, now)
+            if (now - started_at >= 5.0 and now - last_seen >= 1.5) or now >= deadline:
+                break
+
         if group_key not in self.media_groups:
-            logger.warning(f"Медиа-группа {group_key} была удалена до обработки")
+            logger.warning("Media group %s was removed before processing", group_key)
+            self.media_group_last_seen.pop(group_key, None)
             return
-        
-        # Дополнительная проверка: если после задержки пришли новые сообщения, ждем еще
-        initial_count = len(self.media_groups.get(group_key, []))
-        await asyncio.sleep(2.0)
-        
-        if group_key in self.media_groups:
-            final_count = len(self.media_groups[group_key])
-            if final_count > initial_count:
-                logger.info(f"После задержки пришли новые сообщения в группу {group_key}: {initial_count} -> {final_count}")
-                # Ждем еще немного
-                await asyncio.sleep(2.0)
-        
-        # Проверяем еще раз, что группа существует
-        if group_key not in self.media_groups:
-            logger.warning(f"Медиа-группа {group_key} была удалена во время обработки")
-            return
-        
-        logger.info(f"📦 Начинаем обработку медиа-группы {group_key}: собрано {len(self.media_groups[group_key])} сообщений")
-        
-        # Обрабатываем группу
-        await self._handle_media_group(bot, sub_bot_id, user_id, is_anonymous, admin_chat_id, group_key, state)
-    
+
+        logger.info(
+            "Processing media group %s with %s messages",
+            group_key,
+            len(self.media_groups[group_key]),
+        )
+        try:
+            await self._handle_media_group(bot, sub_bot_id, user_id, is_anonymous, admin_chat_id, group_key, state)
+        finally:
+            self.media_group_last_seen.pop(group_key, None)
+
     async def _handle_media_group(self, bot: Bot, sub_bot_id: int, user_id: int, 
                                   is_anonymous: bool, admin_chat_id: int, 
                                   group_key: str, state: FSMContext):
         """Обработка медиа-группы (несколько фото одним сообщением)"""
+        submission_acknowledged = False
         try:
             # Получаем все сообщения группы
             group_messages = self.media_groups.get(group_key, [])
             
             if not group_messages:
                 logger.warning(f"Медиа-группа {group_key} пуста")
+                await bot.send_message(chat_id=user_id, text="❌ Не удалось получить фотографии альбома. Отправьте его ещё раз.")
                 return
             
             # Сортируем по времени получения (message_id)
@@ -866,7 +916,7 @@ class SubBotManager:
             
             # Check length
             use_combined = True
-            if len(full_caption) > 1024:
+            if self._get_utf16_length(full_caption) > 1024:
                 use_combined = False
                 # Fallback: Header+Sender separate, then content
                 header_sender_text, header_sender_entities = self._combine_parts([header_part, sender_part])
@@ -920,13 +970,11 @@ class SubBotManager:
             
             if not media_group:
                 logger.warning(f"Медиа-группа {group_key} не содержит поддерживаемых медиа")
+                await bot.send_message(chat_id=user_id, text="❌ Не получилось обработать альбом. Отправьте фотографии ещё раз одним альбомом.")
                 return
             
             # Отправляем медиа-группу в админ-чат
-            sent_messages = await bot.send_media_group(
-                chat_id=admin_chat_id,
-                media=media_group
-            )
+            sent_messages = await self._send_media_items(bot, admin_chat_id, media_group)
             
             # Первое сообщение - основное
             admin_message = sent_messages[0]
@@ -952,7 +1000,8 @@ class SubBotManager:
             # Также сохраняем file_id для публикации (через запятую)
             media_file_ids_str = ",".join(media_file_ids) if media_file_ids else None
             
-            status = 'published' if is_auto_published else 'pending'
+            # Keep the row pending until Telegram confirms publication.
+            status = 'pending'
             
             # Сериализуем entities для caption
             original_entities_json = entities_to_json(caption_entities) if caption_entities else None
@@ -972,16 +1021,7 @@ class SubBotManager:
             )
             
             if is_auto_published:
-                # Авто-публикация
-                await bot.send_message(
-                    chat_id=admin_chat_id,
-                    text="✅ <b>Одобрено AI и опубликовано</b>",
-                    reply_to_message_id=admin_message.message_id,
-                    parse_mode="HTML"
-                )
-                
-                # Публикация в канал
-                channel_id = sub_bot_data['channel_id']
+                channel_id = sub_bot_data.get('channel_id') if sub_bot_data else None
                 post_footer = sub_bot_data.get('post_footer')
                 post_header = sub_bot_data.get('post_header')
                 header_mode = sub_bot_data.get('header_mode', 'newline')
@@ -1000,20 +1040,16 @@ class SubBotManager:
                     footer=post_footer,
                     user_entities=caption_entities or [],
                 )
-                
-                # Подготовка медиа для канала
+
                 channel_media_group = []
                 channel_caption_added = False
-                
                 for file_id_str in media_file_ids:
                     try:
                         media_type, file_id = file_id_str.split(':', 1)
-                        
                         final_caption = None if channel_caption_added else ("" if rich_caption_separate else caption_html)
                         if final_caption is not None:
                             channel_caption_added = True
                         has_html_in_caption = bool(final_caption and not rich_caption_separate and self._is_valid_html(final_caption))
-                            
                         if media_type == 'photo':
                             channel_media_group.append(InputMediaPhoto(media=file_id, caption=final_caption, parse_mode="HTML" if has_html_in_caption else None))
                         elif media_type == 'video':
@@ -1022,24 +1058,72 @@ class SubBotManager:
                             channel_media_group.append(InputMediaDocument(media=file_id, caption=final_caption, parse_mode="HTML" if has_html_in_caption else None))
                         elif media_type == 'audio':
                             channel_media_group.append(InputMediaAudio(media=file_id, caption=final_caption, parse_mode="HTML" if has_html_in_caption else None))
-                    except Exception as e:
-                        logger.error(f"Ошибка подготовки медиа для авто-публикации: {e}")
-                
-                if channel_media_group:
+                        else:
+                            raise ValueError(f"Unsupported album media type: {media_type}")
+                    except Exception:
+                        logger.exception("Could not prepare one of the album media items")
+                        channel_media_group = []
+                        break
+
+                sent_msgs = None
+                if channel_media_group and len(channel_media_group) == len(media_file_ids):
                     try:
-                        sent_msgs = await bot.send_media_group(chat_id=channel_id, media=channel_media_group)
-                        # Обновляем статус с ID сообщения в канале (первого)
+                        sent_msgs = await self._send_media_items(bot, channel_id, channel_media_group)
+                    except Exception:
+                        logger.exception("Automatic album publication failed")
+
+                if sent_msgs:
+                    try:
                         await self.db.update_message_status(message_db_id, 'published', sent_msgs[0].message_id)
-                        if rich_caption_separate and rich_post_html.strip():
+                    except Exception:
+                        logger.exception("Album was published but its status could not be saved (id=%s)", message_db_id)
+
+                    rich_caption_failed = False
+                    if rich_caption_separate and rich_post_html.strip():
+                        try:
                             await send_rich_html(bot, chat_id=channel_id, content=rich_post_html)
-                        # Уведомление пользователю
-                        await bot.send_message(chat_id=user_id, text="✅ Ваше предложение опубликовано в канале!", reply_to_message_id=first_message.message_id)
-                    except Exception as e:
-                        logger.error(f"Ошибка авто-публикации альбома: {e}")
-                        await bot.send_message(chat_id=admin_chat_id, text=f"❌ Ошибка публикации: {e}", reply_to_message_id=admin_message.message_id)
-                
-                del self.media_groups[group_key]
-                return
+                        except Exception:
+                            rich_caption_failed = True
+                            logger.exception("Album was published but its rich caption failed")
+
+                    try:
+                        status_text = "✅ <b>Одобрено AI и опубликовано</b>"
+                        if rich_caption_failed:
+                            status_text += "\n⚠️ Дополнительное оформление не отправилось"
+                        await bot.send_message(
+                            chat_id=admin_chat_id,
+                            text=status_text,
+                            reply_to_message_id=admin_message.message_id,
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        logger.exception("Could not send the album auto-publication status to moderators")
+
+                    submission_acknowledged = True
+                    try:
+                        user_text = "✅ Ваш альбом опубликован в канале."
+                        if rich_caption_failed:
+                            user_text += " Дополнительное оформление не отправилось."
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=user_text,
+                            reply_to_message_id=first_message.message_id,
+                        )
+                    except Exception:
+                        logger.info("Could not notify submitter about the published album")
+                    self.media_groups.pop(group_key, None)
+                    return
+
+                publication_error = "AI одобрил альбом, но автоматическая публикация не удалась; требуется ручная проверка."
+                logger.error("%s (submission_id=%s)", publication_error, message_db_id)
+                try:
+                    await bot.send_message(
+                        chat_id=admin_chat_id,
+                        text=f"⚠️ {publication_error}",
+                        reply_to_message_id=admin_message.message_id,
+                    )
+                except Exception:
+                    logger.exception("Could not notify moderators about album auto-publication failure")
 
             # Создаем кнопки модерации
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -1049,18 +1133,26 @@ class SubBotManager:
                 ]
             ])
             
-            # Отправляем кнопки модерации
+            # Send a separate action card for albums. Its message ID must be
+            # stored separately from the first media message in the album.
             try:
-                await bot.send_message(
+                action_card = await bot.send_message(
                     chat_id=admin_chat_id,
                     text="Выберите действие:",
                     reply_to_message_id=admin_message.message_id,
-                    reply_markup=keyboard
+                )
+                if not await self.db.set_moderation_message_id(
+                    message_db_id, sub_bot_id, action_card.message_id
+                ):
+                    raise RuntimeError("Could not save the moderation action-card ID")
+                await bot.edit_message_reply_markup(
+                    chat_id=admin_chat_id,
+                    message_id=action_card.message_id,
+                    reply_markup=keyboard,
                 )
                 logger.info(f"Кнопки модерации отправлены для медиа-группы, message_db_id={message_db_id}")
             except Exception as e:
                 logger.error(f"Ошибка отправки кнопок модерации для медиа-группы: {e}")
-                # Пробуем добавить кнопки к первому сообщению группы
                 try:
                     await bot.edit_message_reply_markup(
                         chat_id=admin_chat_id,
@@ -1069,6 +1161,23 @@ class SubBotManager:
                     )
                 except Exception as e2:
                     logger.error(f"Не удалось добавить кнопки к медиа-группе: {e2}")
+                    raise RuntimeError("Не удалось добавить кнопки модерации к альбому") from e2
+
+            submission_acknowledged = True
+            user_notice = (
+                "⚠️ AI одобрил альбом, но его не удалось опубликовать автоматически. "
+                "Я передал его администратору на ручную проверку."
+                if is_auto_published
+                else "✅ Ваш альбом отправлен на модерацию. После проверки администратор опубликует его в канале."
+            )
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=user_notice,
+                    reply_to_message_id=first_message.message_id,
+                )
+            except Exception:
+                logger.info("Could not notify submitter that the album entered moderation")
             
             # Удаляем группу из памяти
             del self.media_groups[group_key]
@@ -1077,6 +1186,11 @@ class SubBotManager:
             
         except Exception as e:
             logger.error(f"Ошибка обработки медиа-группы {group_key}: {e}")
+            if not submission_acknowledged:
+                try:
+                    await bot.send_message(chat_id=user_id, text="❌ Не получилось передать альбом на модерацию. Попробуйте отправить его ещё раз.")
+                except Exception:
+                    logger.info("Could not send album intake failure notice")
             # Удаляем группу из памяти даже при ошибке
             if group_key in self.media_groups:
                 del self.media_groups[group_key]
@@ -2590,17 +2704,20 @@ class SubBotManager:
             if message.media_group_id:
                 # Это часть media group
                 group_id = message.media_group_id
-                group_key = f"{sub_bot_id}_{group_id}"
+                group_key = f"{sub_bot_id}:{message.chat.id}:{user_id}:{group_id}"
                 
                 # Сохраняем сообщение в группу
                 if group_key not in self.media_groups:
                     self.media_groups[group_key] = []
+                    self.media_group_last_seen[group_key] = time.monotonic()
                     # Создаем задачу для обработки группы через небольшой таймаут
                     asyncio.create_task(self._process_media_group_delayed(
                         bot, sub_bot_id, user_id, is_anonymous, admin_chat_id, group_key, state
                     ))
                 
-                self.media_groups[group_key].append(message)
+                if all(item.message_id != message.message_id for item in self.media_groups[group_key]):
+                    self.media_groups[group_key].append(message)
+                self.media_group_last_seen[group_key] = time.monotonic()
                 logger.info(f"Добавлено сообщение в медиа-группу {group_key}, всего: {len(self.media_groups[group_key])}")
                 
                 # Не обрабатываем сразу - ждем все сообщения
